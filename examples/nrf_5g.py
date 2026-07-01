@@ -46,25 +46,12 @@ mandates HTTP/2: terminate h2 via ALPN on a TLS listener, or use cleartext h2c
 (`http2_prior_knowledge`). Everything below :8080 in the examples is plain HTTP
 for curl convenience.
 
-── Scaling on Kubernetes ────────────────────────────────────────────────────
-As a 5G CNF this would be a Deployment; three levers, in order of reach:
-
-  * Per-core (in-pod): siphon runs Python handlers in-process, so on a stock
-    (GIL) interpreter dispatch serialises to ~1 core no matter the pod's CPU
-    limit. Run on free-threaded CPython (3.13t / 3.14t) and handlers spread
-    across every core — the real vertical unlock (see README → Performance).
-  * Horizontal: run N replicas behind a Service; drive an HPA off CPU (dispatch
-    is CPU-bound, not I/O-bound). Add a lightweight readiness route and wire it
-    to a readinessProbe so rollouts don't blackhole traffic.
-  * HTTP/2 load-balancing caveat: h2 connections are long-lived and multiplexed,
-    so an L4 Service pins every stream of a connection to one pod. Balance
-    per-request with an L7 mesh (Envoy/Istio) — in a real 5GC that is exactly the
-    SCP's job — or a headless Service with client-side LB.
-
-State caveat: `_PROFILES` is process-local (same as `rest_api.py`), so this
-particular example is single-replica as written — a real NRF backs the registry
-with a shared/replicated store before scaling out. Stateless NFs behind it scale
-horizontally without that constraint.
+Deploying and scaling this as a 5G CNF on Kubernetes — free-threaded CPython for
+per-core throughput, replicas + HPA, and the HTTP/2 load-balancing caveat (the
+SCP's job in a real 5GC) — is covered in the README ("Deploying on Kubernetes").
+State caveat: `_PROFILES` is process-local (same as `rest_api.py`), so as written
+this example is single-replica — a real NRF backs the registry with a shared /
+replicated store before scaling out.
 """
 
 import json

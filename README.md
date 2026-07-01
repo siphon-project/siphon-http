@@ -197,8 +197,7 @@ listener(s). Three levers scale it, in order of reach:
   to a `readinessProbe` so rollouts and scale-ups don't blackhole traffic.
 - **HTTP/2 load-balancing.** h2 connections are long-lived and multiplexed, so an
   L4 Service pins every stream of a connection to one pod. Balance **per-request**
-  with an L7 mesh (Envoy/Istio) or a headless Service with client-side LB. (In a
-  5G core this is the SCP's job.)
+  with an L7 mesh (Envoy/Istio) or a headless Service with client-side LB.
 
 **State.** Handler state in Python is process-local (per pod). Anything that must
 be shared across replicas — a registry, a cache, a session table — belongs in a
@@ -216,9 +215,9 @@ levers above.
   `@http.on_startup`, run once when the server begins graceful shutdown
   (SIGTERM/SIGINT). It's for cleanup that has to run *in Python* before the
   process exits — e.g.:
-    - **deregister from a service registry** — a 5G NF sending its `DELETE` to
-      the NRF so it doesn't leave a stale entry (see
-      [`examples/nrf_5g.py`](examples/nrf_5g.py));
+    - **deregister from a service registry** — a SIP gateway sending its `DELETE`
+      to the trunk registry so it doesn't leave a stale entry (see
+      [`examples/trunk_registry.py`](examples/trunk_registry.py));
     - flush a pending write buffer / batch, or drain an in-memory queue to
       durable storage;
     - close a database or session pool opened in `@http.on_startup`; release a

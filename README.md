@@ -182,6 +182,34 @@ siphon against **free-threaded CPython** (3.13t / 3.14t), where handlers run on
 every core and aggregate scales. (Same scaling characteristic as any
 Python-in-the-loop siphon addon.)
 
+## Deploying on Kubernetes
+
+siphon-http serves in-process, so a pod runs one siphon process with the addon's
+listener(s). Three levers scale it, in order of reach:
+
+- **Per-core (in-pod).** Handlers run in CPython, so on a stock (GIL) interpreter
+  request dispatch serializes to ~one core regardless of the pod's CPU limit. Run
+  on **free-threaded CPython (3.13t / 3.14t)** and handlers spread across every
+  core — see [Performance](#performance). Size CPU requests/limits to the cores
+  you actually want handlers to use.
+- **Horizontal.** Run N replicas behind a Service and drive an **HPA off CPU**
+  (dispatch is CPU-bound, not I/O-bound). Expose a lightweight route and wire it
+  to a `readinessProbe` so rollouts and scale-ups don't blackhole traffic.
+- **HTTP/2 load-balancing.** h2 connections are long-lived and multiplexed, so an
+  L4 Service pins every stream of a connection to one pod. Balance **per-request**
+  with an L7 mesh (Envoy/Istio) or a headless Service with client-side LB. (In a
+  5G core this is the SCP's job.)
+
+**State.** Handler state in Python is process-local (per pod). Anything that must
+be shared across replicas — a registry, a cache, a session table — belongs in a
+siphon primitive (Rust) or an external store, not a module-level dict. The
+[`examples/`](examples/) that keep state in a dict are single-replica as written
+and say so.
+
+**TLS.** Terminate TLS in the addon (rustls: `tls.cert_path` / `key_path`, plus
+`tls.client_ca` for mutual-TLS east-west) or at an ingress; both compose with the
+levers above.
+
 ## Roadmap
 
 - `@http.on_shutdown` — graceful-shutdown hooks. Needs a siphon-side shutdown

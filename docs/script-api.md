@@ -79,10 +79,17 @@ async def warm():
 ```
 
 !!! warning "No `@http.on_shutdown` yet"
-    `@http.on_shutdown` is on the [roadmap](#roadmap) — it needs a siphon-side
-    shutdown signal exposed to addon tasks. Until then a registered shutdown
-    handler is **not** invoked (the runtime warns loudly rather than failing
-    silently). Do cleanup elsewhere.
+    A script-level teardown hook (the counterpart to `@http.on_startup`) for
+    cleanup that must run *in Python* on the way down — **deregister from a
+    service registry** (e.g. a 5G NF `DELETE`-ing itself from the NRF), flush a
+    write buffer, close a pool opened at startup, release a lease, emit a final
+    metric. It can't just be a signal handler: Python's `signal` module only
+    works on the main thread and siphon runs handlers on worker threads, so a
+    script can't catch SIGTERM itself — only siphon can hand it a callback. On
+    the [roadmap](#roadmap): it needs a siphon-side shutdown signal exposed to
+    addon tasks. Until then a registered handler is **not** invoked (the runtime
+    warns loudly rather than failing silently); do must-run-on-exit cleanup in
+    Rust or via your orchestrator (k8s `preStop` / grace period).
 
 ## `http.Request`
 
@@ -182,9 +189,18 @@ illustration and calls this out.
 
 ## Roadmap
 
-- `@http.on_shutdown` — graceful-shutdown hooks. Needs a siphon-side shutdown
-  signal exposed to addon tasks; until then a registered handler is not invoked
-  (the runtime warns loudly). Do cleanup elsewhere.
+- **`@http.on_shutdown`** — a script-level teardown hook run once on graceful
+  shutdown (SIGTERM/SIGINT), the counterpart to `@http.on_startup`. For cleanup
+  that must run in Python before the process exits: deregister from a service
+  registry (a 5G NF `DELETE`-ing itself from the NRF — see
+  [the NRF example](cookbook/index.md)), flush a write buffer, close a pool
+  opened at startup, release a lease, emit a final metric. It can't be a plain
+  signal handler — Python's `signal` module only works on the main thread and
+  siphon runs handlers on worker threads, so only siphon (which owns the signal)
+  can hand the script a callback. Needs a siphon-side shutdown signal exposed to
+  addon tasks; until then a registered handler is not invoked (the runtime warns
+  loudly). Connection draining is separate — leave it to k8s readiness + grace
+  period.
 - Response-rewriting middleware — the wrap-around `(req, call_next)` form. Today
   middleware is a request guard; post-process inside the route handler.
 - Body streaming for large upload/download — v1 buffers whole bodies, capped.

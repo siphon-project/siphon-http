@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: siphon-http-config
+data:
+  siphon.yaml: |
+    listen:
+      tcp:
+        - "127.0.0.1:15060"   # SIP core wants a listener even for HTTP-only
+    domain:
+      local: ["127.0.0.1"]
+    script:
+      path: /etc/siphon/script.py
+      reload: sighup
+    registrar:
+      backend: memory
+    log:
+      level: info
+      format: json
+    extensions:
+      http: /etc/siphon/http.yaml
+
+  http.yaml: |
+    servers:
+      - listen: "0.0.0.0:8443"
+        tls:
+          cert_path: /etc/siphon/tls/server.crt
+          key_path: /etc/siphon/tls/server.key
+        max_body_bytes: 65536
+        request_timeout_ms: 5000

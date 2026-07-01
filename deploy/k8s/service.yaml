@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: siphon-http
+  labels: { app: siphon-http }
+spec:
+  type: ClusterIP
+  selector: { app: siphon-http }
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+      protocol: TCP

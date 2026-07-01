@@ -1,0 +1,22 @@
+# siphon-http addon config (referenced from siphon.yaml as `extensions.http`).
+# Values support ${VAR} / ${VAR:-default} environment expansion.
+
+servers:
+  # Public HTTPS listener.
+  - listen: "0.0.0.0:8443"
+    tls:
+      cert_path: "/etc/siphon/tls/server.crt"
+      key_path: "/etc/siphon/tls/server.key"
+      # client_ca: "/etc/siphon/tls/client-ca.crt"   # uncomment for mutual TLS
+    max_body_bytes: 65536
+    request_timeout_ms: 5000
+
+  # Localhost-only plain-HTTP listener (e.g. health / metrics).
+  - listen: "127.0.0.1:9090"
+
+clients:
+  api:
+    base_url: "https://api.example.com"
+    timeout_ms: 5000
+    verify: "/etc/siphon/tls/ca.crt"
+    pool_size: 16

@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: siphon-http
+  labels: { app: siphon-http }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: siphon-http }
+  template:
+    metadata:
+      labels: { app: siphon-http }
+    spec:
+      containers:
+        - name: siphon-http
+          image: siphon-http:latest   # your built siphon --features http image
+          args: ["-c", "/etc/siphon/siphon.yaml"]
+          ports:
+            - { name: https, containerPort: 8443 }
+          readinessProbe:
+            tcpSocket: { port: https }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: https }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "250m", memory: "128Mi" }
+            limits: { cpu: "2", memory: "512Mi" }
+          volumeMounts:
+            - { name: config, mountPath: /etc/siphon/siphon.yaml, subPath: siphon.yaml }
+            - { name: config, mountPath: /etc/siphon/http.yaml, subPath: http.yaml }
+            - { name: script, mountPath: /etc/siphon/script.py, subPath: script.py }
+            - { name: tls, mountPath: /etc/siphon/tls, readOnly: true }
+      volumes:
+        - { name: config, configMap: { name: siphon-http-config } }
+        - { name: script, configMap: { name: siphon-http-script } }
+        - { name: tls, secret: { secretName: siphon-http-tls } }

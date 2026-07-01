@@ -1,0 +1,30 @@
+# Minimal siphon config for the harness: the bench route + the http listener.
+# Paths are relative to the repo root (run siphon from there). siphon is
+# SIP-first, so the core still wants a `listen`/`domain` even for an HTTP-only
+# role — the SIP listener below is a throwaway on a high port. If siphon-bin's
+# final extension wiring differs, adjust the `extensions:` block to match.
+
+listen:
+  tcp:
+    - "127.0.0.1:15060"   # unused throwaway SIP listener (core requires one)
+
+domain:
+  local:
+    - "127.0.0.1"
+
+script:
+  path: "harness/bench_echo.py"
+  reload: sighup
+
+registrar:
+  backend: memory
+
+auth:
+  realm: "bench.local"
+
+log:
+  level: warn
+  format: pretty
+
+extensions:
+  http: harness/http.yaml

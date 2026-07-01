@@ -1,0 +1,17 @@
+# Local siphon-http bring-up. Mount your siphon.yaml (with an `extensions.http`
+# entry), the http.yaml addon config, and your routing script.
+services:
+  siphon-http:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: siphon-http:local
+    ports:
+      - "8443:8443"
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./siphon.yaml:/etc/siphon/siphon.yaml:ro
+      - ./http.example.yaml:/etc/siphon/http.yaml:ro
+      - ./script.py:/etc/siphon/script.py:ro
+      - ./tls:/etc/siphon/tls:ro
+    restart: unless-stopped

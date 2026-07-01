@@ -1,0 +1,20 @@
+[package]
+name = "http-load"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "http-load"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+# Plain-HTTP driver — no TLS features needed (we drive http:// loopback).
+reqwest = { version = "0.12", default-features = false }
+clap = { version = "4", features = ["derive"] }
+
+# Standalone workspace so this package stays out of the siphon-http dep graph
+# (it builds fast and doesn't pull the siphon stack).
+[workspace]

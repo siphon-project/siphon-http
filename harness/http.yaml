@@ -1,0 +1,6 @@
+# siphon-http addon config for the load test: one plain-HTTP listener on :8080.
+# Referenced from siphon.bench.yaml as `extensions.http: harness/http.yaml`.
+servers:
+  - listen: "0.0.0.0:8080"
+    max_body_bytes: 65536
+    request_timeout_ms: 5000

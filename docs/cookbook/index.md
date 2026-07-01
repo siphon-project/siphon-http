@@ -11,6 +11,8 @@ build's `script.path` at the file, reference the `http.yaml` under
   params, and JSON bodies over a tiny in-memory resource.
 - **[Reverse proxy](proxy.md)** — a catch-all route that forwards to an upstream
   API over a named, pooled `http.Client`.
+- **[Trunk registry](trunk-registry.md)** — a REST control-plane for SIP trunks /
+  peer gateways: register, heartbeat, discover, and deregister over HTTP + JSON.
 
 Each of these has a matching file under
 [`examples/`](https://github.com/siphon-project/siphon-http/tree/main/examples)

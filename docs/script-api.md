@@ -81,7 +81,8 @@ async def warm():
 !!! warning "No `@http.on_shutdown` yet"
     A script-level teardown hook (the counterpart to `@http.on_startup`) for
     cleanup that must run *in Python* on the way down — **deregister from a
-    service registry** (e.g. a 5G NF `DELETE`-ing itself from the NRF), flush a
+    service registry** (e.g. a SIP gateway `DELETE`-ing itself from the trunk
+    registry), flush a
     write buffer, close a pool opened at startup, release a lease, emit a final
     metric. It can't just be a signal handler: Python's `signal` module only
     works on the main thread and siphon runs handlers on worker threads, so a
@@ -192,8 +193,8 @@ illustration and calls this out.
 - **`@http.on_shutdown`** — a script-level teardown hook run once on graceful
   shutdown (SIGTERM/SIGINT), the counterpart to `@http.on_startup`. For cleanup
   that must run in Python before the process exits: deregister from a service
-  registry (a 5G NF `DELETE`-ing itself from the NRF — see
-  [the NRF example](cookbook/index.md)), flush a write buffer, close a pool
+  registry (a SIP gateway `DELETE`-ing itself from the trunk registry — see
+  [the trunk registry example](cookbook/trunk-registry.md)), flush a write buffer, close a pool
   opened at startup, release a lease, emit a final metric. It can't be a plain
   signal handler — Python's `signal` module only works on the main thread and
   siphon runs handlers on worker threads, so only siphon (which owns the signal)

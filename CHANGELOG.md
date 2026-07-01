@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **SDK testing support for HTTP scripts** — the `siphon-sip` SDK now mocks the
+  `http` namespace, so scripts can be unit-tested with `HttpTestHarness` (route +
+  middleware dispatch, canned outbound `http.Client` responses) and authored with
+  full type hints/docstrings via `pip install siphon-sip` (no listener). Documented
+  under **Testing your scripts** in the script API reference. A CI parity check
+  (`scripts/check_sdk_parity.py`) fails the build if the mock drifts from the
+  runtime `http` surface.
+
 ## [1.0.0] — 2026-07-01
 
 First open-source release — an HTTP/HTTPS addon for

@@ -188,6 +188,38 @@ in Rust (a siphon primitive) or an external store. The
 [REST API cookbook](cookbook/rest-api.md) uses a process-local dict purely for
 illustration and calls this out.
 
+## Testing your scripts
+
+You can unit-test HTTP scripts without binding a real listener. The
+[`siphon-sip` SDK](https://pypi.org/project/siphon-sip/) (`pip install
+siphon-sip`) mocks the `http` namespace — the `@http.route` / `@http.middleware`
+/ `@http.on_startup` decorators and the `Request` / `Response` / `Client` types —
+and ships an `HttpTestHarness` that dispatches mock requests through the
+middleware chain into your route handlers. Outbound `http.Client` calls are
+recorded and answered from canned responses, so a route that calls upstream is
+testable in isolation:
+
+```python
+from siphon_sdk.http_testing import HttpTestHarness
+from siphon_sdk.http import MockResponse
+
+def test_user_proxy():
+    harness = HttpTestHarness()
+    # canned upstream response for the outbound http.Client call
+    harness.add_response(MockResponse(status=200, body=b'{"name":"alice"}'))
+    harness.load_script("examples/rest_api.py")
+
+    resp = harness.request("GET", "/users/42")
+    assert resp.status == 200
+
+    # assert on what the script sent upstream
+    assert harness.sent_requests[0]["path"] == "/v1/users/42"
+```
+
+The mock also gives IDEs and LLMs the full type hints and docstrings for the
+namespace, which helps when authoring scripts. It tracks this crate's runtime
+surface — CI (`scripts/check_sdk_parity.py`) fails if they drift.
+
 ## Roadmap
 
 - **`@http.on_shutdown`** — a script-level teardown hook run once on graceful

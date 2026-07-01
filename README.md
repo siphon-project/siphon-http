@@ -8,6 +8,9 @@ buffering, and the outbound connection pool are Rust ([axum](https://github.com/
 + [hyper](https://github.com/hyperium/hyper) + [reqwest](https://github.com/seanmonstar/reqwest)
 + [rustls](https://github.com/rustls/rustls)); your handlers are Python.
 
+📖 **Documentation: [http.siphon-sip.org](https://http.siphon-sip.org)** — overview,
+configuration, the script API, a cookbook, deployment, and performance.
+
 ```python
 from siphon import http
 

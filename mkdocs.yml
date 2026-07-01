@@ -1,0 +1,72 @@
+site_name: siphon-http
+site_description: HTTP/HTTPS addon for siphon — serve and call HTTP from the same free-threaded Python routing scripts that handle SIP
+site_url: https://http.siphon-sip.org/
+repo_url: https://github.com/siphon-project/siphon-http
+repo_name: siphon-project/siphon-http
+edit_uri: edit/main/docs/
+copyright: MIT-licensed. An HTTP/HTTPS addon for SIPhon.
+
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.instant
+    - navigation.tracking
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+nav:
+  - Home: index.md
+  - Configuration: configuration.md
+  - Script API: script-api.md
+  - Cookbook:
+      - Overview: cookbook/index.md
+      - Webhook receiver: cookbook/webhook.md
+      - REST API: cookbook/rest-api.md
+      - Reverse proxy: cookbook/proxy.md
+  - Running in production:
+      - Deployment & operations: deployment.md
+      - Performance & scaling: performance.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search

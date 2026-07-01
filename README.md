@@ -212,9 +212,29 @@ levers above.
 
 ## Roadmap
 
-- `@http.on_shutdown` — graceful-shutdown hooks. Needs a siphon-side shutdown
-  signal exposed to addon tasks; until then a registered handler is not invoked
-  (the runtime warns loudly rather than failing silently). Do cleanup elsewhere.
+- **`@http.on_shutdown`** — a script-level teardown hook, the counterpart to
+  `@http.on_startup`, run once when the server begins graceful shutdown
+  (SIGTERM/SIGINT). It's for cleanup that has to run *in Python* before the
+  process exits — e.g.:
+    - **deregister from a service registry** — a 5G NF sending its `DELETE` to
+      the NRF so it doesn't leave a stale entry (see
+      [`examples/nrf_5g.py`](examples/nrf_5g.py));
+    - flush a pending write buffer / batch, or drain an in-memory queue to
+      durable storage;
+    - close a database or session pool opened in `@http.on_startup`; release a
+      lease or distributed lock;
+    - emit a final metric, audit record, or "going away" log line.
+
+  Why it needs siphon support (and can't just be a signal handler): Python's
+  `signal` module only works on the main thread, but siphon runs script handlers
+  on worker threads — so a script can't install its own SIGTERM handler (it
+  raises `ValueError`). Only siphon, which owns the signal, can hand the script a
+  shutdown callback. Not wired yet (needs a siphon-side shutdown signal exposed
+  to addon tasks); a registered handler is not invoked and the runtime warns
+  loudly rather than failing silently. Until then, put must-run-on-exit cleanup
+  in the Rust layer, or handle it via your orchestrator (a k8s `preStop` hook /
+  termination grace period). Graceful connection draining is separate and can be
+  left to k8s readiness + grace period.
 - Response-rewriting middleware (the wrap-around `(req, call_next)` form). Today
   middleware is a request guard; post-process inside the route handler.
 - Body streaming for large upload/download (v1 buffers whole bodies, capped).

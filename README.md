@@ -47,11 +47,12 @@ extensions:
 | Query params | ✅ `req.query_params` |
 | Headers (case-insensitive) | ✅ `req.headers`, `req.header(name)` |
 | Request body (buffered, capped) | ✅ `req.body()`, `max_body_bytes` → 413 |
+| Request timeout | ✅ `request_timeout_ms` → 504 |
 | Multiple listeners (e.g. public HTTPS + localhost HTTP) | ✅ `servers: [ … ]` |
 | TLS termination | ✅ `tls: { cert_path, key_path }` |
 | Mutual TLS (client-cert) | ✅ `tls.client_ca` |
 | HTTP/2 | ✅ auto — h2c (cleartext, preface prior-knowledge) + h2 via ALPN on TLS, HTTP/1.1 on the same socket |
-| Client address | ✅ `req.client` |
+| Client address | ✅ `req.client` (left-most `X-Forwarded-For` when the peer is a `trusted_proxies` IP) |
 | `@http.middleware` request guards | ✅ run before the route; return a `Response` to short-circuit |
 | `@http.on_startup` | ✅ run to completion before any listener accepts |
 | `@http.on_shutdown` | ⏳ roadmap — needs a siphon shutdown hook for addon tasks (see below) |
@@ -150,20 +151,33 @@ async def proxy(req):
 
 ## Performance
 
-The wire and TLS paths are axum/hyper/rustls; siphon-http's own benches
-([`benches/parse.rs`](benches/parse.rs), `cargo bench`) cover the per-request
-Rust work this crate adds (path-param extraction, query parsing, percent-decode,
-config parse). A counting-allocator [leak check](examples/leak_check.rs)
-(`./scripts/mem_leak_test.sh`) asserts live bytes stay flat.
+Two layers, benched separately.
 
-Under load, aggregate throughput is bounded by the **per-request Python handler
-dispatch**, which runs in CPython: on a standard (GIL) interpreter it serializes
-to roughly one core, regardless of how many connections or cores you have. The
-Rust request path is not the limit. Keep per-request handler work minimal (push
-heavy lifting into Rust) and — the real unlock — run siphon against
-**free-threaded CPython** (3.13t / 3.14t), where handlers run on every core and
-aggregate scales. The [`harness/`](harness/) reproduces both. (This is the same
-scaling characteristic as any Python-in-the-loop siphon addon.)
+**Per-request Rust work** (`cargo bench`, [`benches/parse.rs`](benches/parse.rs)) —
+the wire and TLS paths are axum/hyper/rustls; these cover the work this crate
+adds. Indicative single-core numbers:
+
+| Path | Time |
+|---|---|
+| path-param extraction (`/users/{id}/orders/{order}`) | ~135 ns |
+| query parsing (4 params) | ~255 ns |
+| percent-decode | ~35 ns |
+| `http.yaml` parse (boot / hot-reload) | ~5.5 µs |
+
+A counting-allocator [leak check](examples/leak_check.rs)
+(`./scripts/mem_leak_test.sh`) hammers these and asserts **live bytes stay flat**
+(Δ 0 over 200k cycles). Both run in CI.
+
+**End-to-end** (the [`harness/`](harness/)) — against its in-process mock (no
+siphon), the driver + loopback sustain **~270k req/s at sub-100 µs p50**; that's
+the driver ceiling, not a real server. Against a live `siphon --features http`,
+aggregate throughput is bounded by the **per-request Python handler dispatch**
+under the CPython GIL: it serializes to roughly one core regardless of
+connections or cores — the Rust request path is not the limit. Keep per-request
+handler work minimal (push heavy lifting into Rust) and — the real unlock — run
+siphon against **free-threaded CPython** (3.13t / 3.14t), where handlers run on
+every core and aggregate scales. (Same scaling characteristic as any
+Python-in-the-loop siphon addon.)
 
 ## Roadmap
 

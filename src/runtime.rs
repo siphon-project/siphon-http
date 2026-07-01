@@ -25,9 +25,10 @@
 //!   fires if a script registers one).
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::path::Path;
+use std::io::BufReader;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, MatchedPath, Request as AxumRequest};
@@ -37,8 +38,12 @@ use axum::routing::{any, MethodRouter};
 use axum::Router;
 use http_body_util::BodyExt;
 use pyo3::prelude::*;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
+use rustls::{RootCertStore, ServerConfig as RustlsServerConfig};
 use siphon::script::{HandlerHandle, ScriptHandle};
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 
 use crate::config::ClientConfig;
 use crate::parse::{extract_path_params, parse_query};
@@ -61,6 +66,59 @@ pub(crate) fn named_client(name: &str) -> Option<ClientConfig> {
     NAMED_CLIENTS.get().and_then(|m| m.get(name).cloned())
 }
 
+// ── Trusted proxies (X-Forwarded-For) ────────────────────────────────────
+//
+// The union of every listener's `trusted_proxies`. When a request's socket peer
+// is in this set, the left-most `X-Forwarded-For` entry is taken as the client
+// address instead of the socket peer — so a request through a trusted LB reports
+// the real client. Untrusted peers can't spoof it.
+
+static TRUSTED_PROXIES: OnceLock<Vec<IpAddr>> = OnceLock::new();
+
+fn set_trusted_proxies(entries: &[String]) {
+    let ips: Vec<IpAddr> = entries
+        .iter()
+        .filter_map(|e| match e.parse::<IpAddr>() {
+            Ok(ip) => Some(ip),
+            Err(_) => {
+                tracing::warn!(
+                    target: "siphon_http",
+                    entry = %e,
+                    "trusted_proxies entry is not a bare IP address (CIDR ranges are not supported) — ignoring"
+                );
+                None
+            }
+        })
+        .collect();
+    let _ = TRUSTED_PROXIES.set(ips);
+}
+
+fn peer_is_trusted(ip: &IpAddr) -> bool {
+    TRUSTED_PROXIES.get().is_some_and(|v| v.contains(ip))
+}
+
+/// The client address to report to scripts: the left-most `X-Forwarded-For`
+/// entry when the socket peer is a trusted proxy, otherwise the socket peer.
+fn client_addr(peer: Option<SocketAddr>, headers: &HeaderMap) -> String {
+    match peer {
+        Some(peer) => {
+            if peer_is_trusted(&peer.ip()) {
+                if let Some(first) = headers
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|xff| xff.split(',').next())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    return first.to_string();
+                }
+            }
+            peer.to_string()
+        }
+        None => "unknown:0".to_string(),
+    }
+}
+
 /// Spin up the HTTP listeners and register the outbound client pool.
 ///
 /// Called from [`crate::task`]'s closure, so we're already on the tokio
@@ -69,6 +127,12 @@ pub(crate) fn named_client(name: &str) -> Option<ClientConfig> {
 /// bind each `cfg.servers` entry.
 pub fn spawn(cfg: HttpConfig, script: ScriptHandle) {
     set_named_clients(cfg.clients.clone());
+    set_trusted_proxies(
+        &cfg.servers
+            .iter()
+            .flat_map(|s| s.trusted_proxies.iter().cloned())
+            .collect::<Vec<_>>(),
+    );
     let runtime = script.tokio_handle().clone();
 
     // Snapshot handlers once at startup. Live reload (re-snapshotting on
@@ -162,7 +226,21 @@ fn build_router(
         .map(|s| s.max_body_bytes)
         .max()
         .unwrap_or(1 << 20);
-    router.layer(RequestBodyLimitLayer::new(max_body))
+    // Router-wide (most permissive across listeners). Bounds the client's wait
+    // and returns 408; a Python handler already executing can't be cancelled
+    // mid-call, so the work may continue after the client is answered.
+    let timeout = cfg
+        .servers
+        .iter()
+        .map(|s| s.request_timeout_ms)
+        .max()
+        .unwrap_or(30_000);
+    router
+        .layer(RequestBodyLimitLayer::new(max_body))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::GATEWAY_TIMEOUT,
+            Duration::from_millis(timeout),
+        ))
 }
 
 fn read_route_options(py: Python<'_>, handler: &HandlerHandle) -> PyResult<(String, Vec<Method>)> {
@@ -244,11 +322,11 @@ async fn dispatch(
         .unwrap_or_default();
     let query_params = parse_query(parts.uri.query().unwrap_or(""));
     let headers = headers_to_map(&parts.headers);
-    let client = parts
+    let peer = parts
         .extensions
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|c| c.0.to_string())
-        .unwrap_or_else(|| "unknown:0".to_string());
+        .map(|c| c.0);
+    let client = client_addr(peer, &parts.headers);
 
     let py_request = PyRequest::from_parts(
         method.as_str().to_string(),
@@ -401,12 +479,64 @@ async fn serve_one(server: ServerConfig, router: Router) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Build the TLS config for a listener.
+///
+/// Loads the server cert chain + key, wires client-certificate verification
+/// when `client_ca` is set (mutual TLS), and advertises ALPN `h2, http/1.1` so
+/// HTTP/2 negotiates over TLS. Pins the ring crypto provider explicitly to
+/// avoid ambiguity when more than one provider is linked.
 async fn build_rustls_config(
     tls: &TlsConfig,
 ) -> std::io::Result<axum_server::tls_rustls::RustlsConfig> {
-    axum_server::tls_rustls::RustlsConfig::from_pem_file(
-        Path::new(&tls.cert_path),
-        Path::new(&tls.key_path),
-    )
-    .await
+    let certs = load_certs(&tls.cert_path)?;
+    let key = load_key(&tls.key_path)?;
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = RustlsServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(to_io)?;
+
+    let builder = match &tls.client_ca {
+        Some(ca_path) => {
+            let mut roots = RootCertStore::empty();
+            for cert in load_certs(ca_path)? {
+                roots.add(cert).map_err(to_io)?;
+            }
+            let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .map_err(to_io)?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+
+    let mut config = builder.with_single_cert(certs, key).map_err(to_io)?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+        Arc::new(config),
+    ))
+}
+
+fn load_certs(path: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, format!("open {path}: {e}"))
+    })?;
+    rustls_pemfile::certs(&mut BufReader::new(file)).collect()
+}
+
+fn load_key(path: &str) -> std::io::Result<PrivateKeyDer<'static>> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, format!("open {path}: {e}"))
+    })?;
+    rustls_pemfile::private_key(&mut BufReader::new(file))?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("no private key in {path}"),
+        )
+    })
+}
+
+fn to_io<E: std::fmt::Display>(e: E) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
 }

@@ -58,8 +58,10 @@ pub struct ServerConfig {
     #[serde(default = "default_request_timeout")]
     pub request_timeout_ms: u64,
 
-    /// IP addresses (or CIDRs) trusted to set `X-Forwarded-For`. Empty =
-    /// client IP from the socket only.
+    /// IP addresses trusted to set `X-Forwarded-For` (exact match; CIDR ranges
+    /// are not supported and are ignored with a warning). When a request's
+    /// socket peer is listed here, its left-most `X-Forwarded-For` entry is
+    /// reported to scripts as the client address. Empty = socket peer only.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 }

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **WhatsApp Cloud API example** (`examples/whatsapp_cloud_api.py`) + cookbook
+  recipe: a messaging bridge built entirely on the addon — outbound Graph POSTs
+  over a pooled `http.Client("graph")`, and the inbound webhook (GET verify
+  handshake + POST events, with `X-Hub-Signature-256` HMAC verified over the raw
+  `req.body()`) on `@http.route`, with message-id dedup via the `cache` namespace.
+  No addon code — it is a worked script showing the client + server halves
+  together.
+
 ## [1.0.1] — 2026-07-01
 
 ### Added

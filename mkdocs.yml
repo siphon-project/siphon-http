@@ -45,6 +45,7 @@ nav:
   - Cookbook:
       - Overview: cookbook/index.md
       - Webhook receiver: cookbook/webhook.md
+      - WhatsApp Cloud API: cookbook/whatsapp-cloud-api.md
       - REST API: cookbook/rest-api.md
       - Reverse proxy: cookbook/proxy.md
       - Trunk registry: cookbook/trunk-registry.md

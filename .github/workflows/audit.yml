@@ -1,8 +1,12 @@
-# .github/workflows/audit.yml — RustSec advisory + license/source policy.
+# .github/workflows/audit.yml — RustSec advisory scan.
 #
-# RustSec advisories are time-varying: a new advisory can land against an
-# unchanged dependency, so this runs on a schedule (and whenever the dependency
-# set changes) rather than gating every PR.
+# This is the time-varying half of the cargo-deny policy: a new advisory can
+# land against a dependency nobody touched, so it is not a function of any
+# diff. Running it as a PR gate would turn an unrelated feature branch red for
+# something the branch did not cause, so it runs on a schedule (plus whenever
+# main's dependency set changes) and reports by opening a tracking issue.
+#
+# The deterministic half — bans / licenses / sources — is a PR gate in ci.yaml.
 name: Security audit
 
 on:
@@ -18,13 +22,76 @@ on:
 
 permissions:
   contents: read
+  issues: write
+
+concurrency:
+  group: security-audit
+  cancel-in-progress: false
+
+env:
+  ISSUE_LABEL: rustsec
 
 jobs:
-  cargo-deny:
-    name: cargo-deny
+  advisories:
+    name: cargo-deny advisories
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+
+      - id: deny
+        continue-on-error: true
+        uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check
+          command: check advisories
+
+      # One open issue at a time: file it on the first failing run, and comment
+      # on the existing one afterwards so a lingering advisory does not spawn a
+      # fresh issue every Monday.
+      - name: Report advisories
+        if: steps.deny.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create "$ISSUE_LABEL" --force \
+            --color b60205 \
+            --description "RustSec advisory against a dependency"
+          body=$(cat <<BODY
+          \`cargo deny check advisories\` failed on \`${GITHUB_REF_NAME}\`.
+
+          Run: ${RUN_URL} (the advisory IDs and the paths that pull them in are in the job log)
+
+          Reproduce locally with \`cargo deny check advisories\`.
+
+          Fix by upgrading the dependency, or — if no upgrade exists yet — add the ID to
+          \`ignore\` in \`deny.toml\` with a comment saying why it is not exploitable here
+          and what has to happen before the entry can come back out.
+          BODY
+          )
+          existing=$(gh issue list --label "$ISSUE_LABEL" --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --label "$ISSUE_LABEL" \
+              --title "RustSec advisory in the dependency graph" \
+              --body "$body"
+          fi
+
+      - name: Close the advisory issue once clean
+        if: steps.deny.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          for number in $(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq '.[].number'); do
+            gh issue close "$number" \
+              --comment "\`cargo deny check advisories\` is clean again as of ${RUN_URL}."
+          done
+
+      # Keep the run red as well as filed, so the Actions history and the
+      # scheduled-failure email both reflect it.
+      - name: Fail on advisories
+        if: steps.deny.outcome == 'failure'
+        run: exit 1

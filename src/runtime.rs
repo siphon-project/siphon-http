@@ -25,7 +25,6 @@
 //!   fires if a script registers one).
 
 use std::collections::HashMap;
-use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -38,6 +37,7 @@ use axum::routing::{any, MethodRouter};
 use axum::Router;
 use http_body_util::BodyExt;
 use pyo3::prelude::*;
+use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig as RustlsServerConfig};
@@ -522,21 +522,273 @@ fn load_certs(path: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
     let file = std::fs::File::open(path).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::NotFound, format!("open {path}: {e}"))
     })?;
-    rustls_pemfile::certs(&mut BufReader::new(file)).collect()
+    CertificateDer::pem_reader_iter(file)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| pem_to_io("certificate", path, error))
 }
 
 fn load_key(path: &str) -> std::io::Result<PrivateKeyDer<'static>> {
     let file = std::fs::File::open(path).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::NotFound, format!("open {path}: {e}"))
     })?;
-    rustls_pemfile::private_key(&mut BufReader::new(file))?.ok_or_else(|| {
-        std::io::Error::new(
+    PrivateKeyDer::from_pem_reader(file).map_err(|error| pem_to_io("private key", path, error))
+}
+
+/// Map a `rustls-pki-types` PEM error onto the `io::Error` shape the TLS startup
+/// path reports, keeping the messages operators already see in the logs.
+fn pem_to_io(what: &str, path: &str, error: pem::Error) -> std::io::Error {
+    match error {
+        pem::Error::Io(error) => error,
+        pem::Error::NoItemsFound => std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("no private key in {path}"),
-        )
-    })
+            format!("no {what} in {path}"),
+        ),
+        other => std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("parse {what} from {path}: {other}"),
+        ),
+    }
 }
 
 fn to_io<E: std::fmt::Display>(e: E) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_certs, load_key, pem_to_io, RustlsServerConfig};
+    use rustls::pki_types::pem;
+    use rustls::pki_types::PrivateKeyDer;
+    use std::io::ErrorKind;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A temp file that deletes itself, so these tests need no dev-dependency.
+    struct TempPem(PathBuf);
+
+    impl TempPem {
+        fn new(contents: &str) -> Self {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "siphon-http-pem-{}-{}.pem",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::write(&path, contents).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+
+    impl Drop for TempPem {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// The loaders decode PEM framing; they do not validate X.509 / DER
+    /// contents, so a section body only has to be valid base64.
+    fn section(kind: &str, body: &str) -> String {
+        format!("-----BEGIN {kind}-----\n{body}\n-----END {kind}-----\n")
+    }
+
+    #[test]
+    fn certs_are_loaded_in_file_order() {
+        let file = TempPem::new(&format!(
+            "{}{}",
+            section("CERTIFICATE", "AQID"),
+            section("CERTIFICATE", "BAUG")
+        ));
+        let certs = load_certs(file.path()).unwrap();
+        assert_eq!(certs.len(), 2);
+        assert_eq!(certs[0].as_ref(), &[1, 2, 3]);
+        assert_eq!(certs[1].as_ref(), &[4, 5, 6]);
+    }
+
+    #[test]
+    fn certs_skip_non_certificate_sections() {
+        // A combined cert+key PEM is common; load_certs must ignore the key
+        // rather than fail (parity with the previous rustls-pemfile behaviour).
+        let file = TempPem::new(&format!(
+            "{}{}{}",
+            section("PRIVATE KEY", "AQID"),
+            section("CERTIFICATE", "BAUG"),
+            section("EC PARAMETERS", "BwgJ")
+        ));
+        let certs = load_certs(file.path()).unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].as_ref(), &[4, 5, 6]);
+    }
+
+    #[test]
+    fn certs_empty_file_is_not_an_error() {
+        // with_single_cert is what rejects an empty chain; loading must not.
+        let file = TempPem::new("# no PEM sections here\n");
+        assert!(load_certs(file.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn certs_missing_file_is_not_found() {
+        let missing = Path::new(&std::env::temp_dir()).join("siphon-http-absent.pem");
+        let error = load_certs(missing.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert!(error.to_string().contains("open "));
+    }
+
+    #[test]
+    fn certs_malformed_base64_reports_the_path() {
+        let file = TempPem::new(&section("CERTIFICATE", "not!valid!base64!"));
+        let error = load_certs(file.path()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("parse certificate from"));
+        assert!(error.to_string().contains(file.path()));
+    }
+
+    #[test]
+    fn key_loads_pkcs8() {
+        let file = TempPem::new(&section("PRIVATE KEY", "AQID"));
+        assert!(matches!(
+            load_key(file.path()).unwrap(),
+            PrivateKeyDer::Pkcs8(_)
+        ));
+    }
+
+    #[test]
+    fn key_loads_pkcs1() {
+        let file = TempPem::new(&section("RSA PRIVATE KEY", "AQID"));
+        assert!(matches!(
+            load_key(file.path()).unwrap(),
+            PrivateKeyDer::Pkcs1(_)
+        ));
+    }
+
+    #[test]
+    fn key_loads_sec1() {
+        let file = TempPem::new(&section("EC PRIVATE KEY", "AQID"));
+        assert!(matches!(
+            load_key(file.path()).unwrap(),
+            PrivateKeyDer::Sec1(_)
+        ));
+    }
+
+    #[test]
+    fn key_skips_leading_certificate_section() {
+        let file = TempPem::new(&format!(
+            "{}{}",
+            section("CERTIFICATE", "BAUG"),
+            section("PRIVATE KEY", "AQID")
+        ));
+        let key = load_key(file.path()).unwrap();
+        assert!(matches!(&key, PrivateKeyDer::Pkcs8(_)));
+        assert_eq!(key.secret_der(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn key_absent_reports_no_private_key() {
+        let file = TempPem::new(&section("CERTIFICATE", "AQID"));
+        let error = load_key(file.path()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("no private key in"));
+        assert!(error.to_string().contains(file.path()));
+    }
+
+    #[test]
+    fn key_missing_file_is_not_found() {
+        let missing = Path::new(&std::env::temp_dir()).join("siphon-http-absent-key.pem");
+        assert_eq!(
+            load_key(missing.to_str().unwrap()).unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn pem_io_errors_pass_through_unwrapped() {
+        let inner = std::io::Error::new(ErrorKind::PermissionDenied, "denied");
+        let mapped = pem_to_io("certificate", "/tmp/x.pem", pem::Error::Io(inner));
+        assert_eq!(mapped.kind(), ErrorKind::PermissionDenied);
+    }
+
+    // A throwaway self-signed P-256 cert for `example.com` / 127.0.0.1, valid
+    // until 2126, together with its key in both PKCS#8 and SEC1 encodings. The
+    // framing tests above use fake section bodies on purpose; these are real DER
+    // so that rustls itself checks the loaders, rather than a round-trip through
+    // our own code.
+    const REAL_CERT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----\n\
+MIIBojCCAUegAwIBAgIUMK9ymiTuCf2w4huzkk+v+Z4BnX0wCgYIKoZIzj0EAwIw\n\
+FjEUMBIGA1UEAwwLZXhhbXBsZS5jb20wIBcNMjYwODE4MDcwNTA5WhgPMjEyNjA3\n\
+MjUwNzA1MDlaMBYxFDASBgNVBAMMC2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYI\n\
+KoZIzj0DAQcDQgAEQsM0yzEzLsLgrZGUozDHeC/4ZbnMQxA3w+zqPh+58buq/1jR\n\
+dhQXGOGGj2W2oE4Z0ETjIVryRGzZgKSWuJOtFaNxMG8wHQYDVR0OBBYEFCq3PZqr\n\
+UKt+AwA3ajA4pW2+xrXoMB8GA1UdIwQYMBaAFCq3PZqrUKt+AwA3ajA4pW2+xrXo\n\
+MA8GA1UdEwEB/wQFMAMBAf8wHAYDVR0RBBUwE4ILZXhhbXBsZS5jb22HBH8AAAEw\n\
+CgYIKoZIzj0EAwIDSQAwRgIhAL940V2kbB7+i+1JoSmoLF2vcfEy2+E58zLaz/xz\n\
+6zZmAiEAij+fuGdHIUc4hjFxWZ5cP0os+bTmoXTEjWoAcug9uVE=\n\
+-----END CERTIFICATE-----\n\
+";
+
+    const REAL_KEY_PKCS8_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgtKcpHfQWCT78MdtW\n\
+umwRxA2YHMgDT/0brTs9cpzFtV2hRANCAARCwzTLMTMuwuCtkZSjMMd4L/hlucxD\n\
+EDfD7Oo+H7nxu6r/WNF2FBcY4YaPZbagThnQROMhWvJEbNmApJa4k60V\n\
+-----END PRIVATE KEY-----\n\
+";
+
+    const REAL_KEY_SEC1_PEM: &str = "\
+-----BEGIN EC PRIVATE KEY-----\n\
+MHcCAQEEILSnKR30Fgk+/DHbVrpsEcQNmBzIA0/9G607PXKcxbVdoAoGCCqGSM49\n\
+AwEHoUQDQgAEQsM0yzEzLsLgrZGUozDHeC/4ZbnMQxA3w+zqPh+58buq/1jRdhQX\n\
+GOGGj2W2oE4Z0ETjIVryRGzZgKSWuJOtFQ==\n\
+-----END EC PRIVATE KEY-----\n\
+";
+
+    /// Feed a real cert/key pair through the loaders into rustls. `with_single_cert`
+    /// parses the DER and checks the key matches the certificate's public key, so
+    /// this fails if the migration mangles or mislabels either one.
+    fn assert_builds_rustls_config(key_pem: &str) {
+        let cert_file = TempPem::new(REAL_CERT_PEM);
+        let key_file = TempPem::new(key_pem);
+
+        let certs = load_certs(cert_file.path()).unwrap();
+        let key = load_key(key_file.path()).unwrap();
+        assert_eq!(certs.len(), 1);
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = RustlsServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key);
+        assert!(
+            config.is_ok(),
+            "rustls rejected the loaded pair: {config:?}"
+        );
+    }
+
+    #[test]
+    fn real_cert_with_pkcs8_key_builds_a_rustls_config() {
+        assert_builds_rustls_config(REAL_KEY_PKCS8_PEM);
+    }
+
+    #[test]
+    fn real_cert_with_sec1_key_builds_a_rustls_config() {
+        // Same key, SEC1-encoded: proves the Sec1 branch of load_key hands rustls
+        // something it can actually use, not just a correctly-tagged blob.
+        assert_builds_rustls_config(REAL_KEY_SEC1_PEM);
+    }
+
+    #[test]
+    fn real_cert_is_loaded_as_a_single_der_certificate() {
+        // DER always starts with a SEQUENCE tag; a base64 slip would not.
+        let file = TempPem::new(REAL_CERT_PEM);
+        let certs = load_certs(file.path()).unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].as_ref()[0], 0x30);
+        assert!(certs[0].as_ref().len() > 300);
+    }
 }

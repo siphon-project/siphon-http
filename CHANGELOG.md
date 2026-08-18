@@ -5,7 +5,7 @@ All notable changes to `siphon-http` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.0.2] — 2026-08-18
 
 ### Added
 
@@ -16,6 +16,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `req.body()`) on `@http.route`, with message-id dedup via the `cache` namespace.
   No addon code — it is a worked script showing the client + server halves
   together.
+
+### Changed
+
+- **TLS certificate and key loading moved off `rustls-pemfile`** onto the PEM
+  decoder built into `rustls-pki-types` (`PemObject`), dropping a dependency
+  whose upstream repository has been archived since August 2025 (RUSTSEC-2025-0134
+  — unmaintained, no vulnerability). The crate was already a thin wrapper over
+  the same parsing code, so loading behaviour is unchanged: a cert file's
+  non-certificate sections are still skipped, and a key is still accepted as
+  PKCS#8, PKCS#1 or SEC1. A malformed PEM now reports `InvalidInput` rather than
+  `InvalidData` and names the offending file in the message; nothing matches on
+  the kind, so this only affects what gets logged. This also lets the advisory
+  ignore be removed from `deny.toml` rather than carried indefinitely, and clears
+  the last audit failure for binaries composing this addon.
 
 ## [1.0.1] — 2026-07-01
 

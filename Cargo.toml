@@ -1,6 +1,6 @@
 [package]
 name = "siphon-http"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 rust-version = "1.80"
 description = "HTTP/HTTPS addon for siphon — exposes a scriptable `http` namespace to Python"
@@ -50,7 +50,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 # TLS
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-rustls-pemfile = "2"
 tokio-rustls = "0.26"
 
 async-trait = "0.1"

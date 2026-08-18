@@ -22,10 +22,6 @@ ignore = [
     # paste — unmaintained transitive (no vuln); pulled via the pyo3 stack.
     # Remove once the parent crate drops it.
     "RUSTSEC-2024-0436",
-    # rustls-pemfile — unmaintained (no vuln); a thin wrapper over rustls-pki-types
-    # pulled through the rustls/reqwest/axum-server stack. No safe upgrade exists
-    # yet. Remove once the TLS stack drops it for rustls-pki-types' PemObject.
-    "RUSTSEC-2025-0134",
 ]
 
 [bans]

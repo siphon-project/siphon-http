@@ -1,5 +1,11 @@
 # cargo-deny — dependency-graph security / license / source policy for siphon-http.
-# Local: `cargo deny check`  ·  CI: .github/workflows/audit.yml
+# Local: `cargo deny check`
+# CI is split by what the check depends on:
+#   bans / licenses / sources — a function of the dependency graph only, so they
+#     gate every pull request (.github/workflows/ci.yaml, job `deny`).
+#   advisories — time-varying (a new RustSec entry can land against a dependency
+#     nobody touched), so they run weekly and on main instead of blocking a PR
+#     for something that PR did not cause (.github/workflows/audit.yml).
 # Docs: https://embarkstudios.github.io/cargo-deny/
 
 [graph]
@@ -23,6 +29,14 @@ ignore = [
 ]
 
 [bans]
+# Both stay at "warn" on purpose, so the PR gate reports duplicates without
+# failing on them:
+#   multiple-versions — nearly all of the current duplicates (tower-http, the
+#     RustCrypto stack, getrandom/rand) are pulled in twice by siphon-sip's own
+#     tree. siphon-http cannot unify them; denying here would block every PR on
+#     an upstream version bump. Revisit once the siphon-sip graph converges.
+#   wildcards — `siphon-sip` is a permanent git dependency with no version
+#     requirement, which is exactly what this check flags.
 multiple-versions = "warn"
 wildcards = "warn"
 # siphon-http embeds CPython via PyO3 (links libpython); that C dependency is

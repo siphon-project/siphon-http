@@ -123,8 +123,14 @@ fn client_addr(peer: Option<SocketAddr>, headers: &HeaderMap) -> String {
 ///
 /// Called from [`crate::task`]'s closure, so we're already on the tokio
 /// runtime that `script.tokio_handle()` points to. Build one shared
-/// `axum::Router` across all listeners, run any `http.startup` hooks, then
-/// bind each `cfg.servers` entry.
+/// `axum::Router` across all listeners, bind each `cfg.servers` entry, run any
+/// `http.startup` hooks, then start accepting.
+///
+/// Binding happens here, before this returns, so a bad address, a port in use
+/// or an unreadable TLS file is known at startup. If the script registered
+/// routes, that is fatal: the process exits, the way siphon refuses to start
+/// on a SIP listener it cannot bind, because a route with no listener is
+/// unreachable while everything else about the process looks healthy.
 pub fn spawn(cfg: HttpConfig, script: ScriptHandle) {
     set_named_clients(cfg.clients.clone());
     set_trusted_proxies(
@@ -162,8 +168,34 @@ pub fn spawn(cfg: HttpConfig, script: ScriptHandle) {
         );
     }
 
+    let route_count = routes.len();
     let router = build_router(routes, Arc::clone(&middlewares), &cfg, script.clone());
-    let servers = cfg.servers.clone();
+
+    let mut bound = Vec::new();
+    let mut failures = 0;
+    for server in &cfg.servers {
+        match bind_listener(server) {
+            Ok(listener) => bound.push(listener),
+            Err(error) => {
+                failures += 1;
+                tracing::error!(target: "siphon_http", %error, "listener failed");
+            }
+        }
+    }
+    if listener_failures_are_fatal(route_count, failures) {
+        tracing::error!(
+            target: "siphon_http",
+            routes = route_count,
+            failed = failures,
+            "refusing to start: http routes are registered but a listener could not bind"
+        );
+        eprintln!(
+            "siphon-http: {failures} of {} listener(s) could not bind and the script \
+             registered {route_count} http route(s); refusing to start",
+            cfg.servers.len()
+        );
+        std::process::exit(1);
+    }
 
     runtime.spawn(async move {
         // Startup hooks run to completion before any listener accepts.
@@ -174,11 +206,12 @@ pub fn spawn(cfg: HttpConfig, script: ScriptHandle) {
         }
 
         let mut tasks = Vec::new();
-        for server in servers {
+        for listener in bound {
             let router = router.clone();
             tasks.push(tokio::spawn(async move {
-                if let Err(e) = serve_one(server, router).await {
-                    tracing::error!(target: "siphon_http", error = %e, "listener failed");
+                let listen = listener.listen.clone();
+                if let Err(e) = listener.serve(router).await {
+                    tracing::error!(target: "siphon_http", listen = %listen, error = %e, "listener failed");
                 }
             }));
         }
@@ -459,24 +492,91 @@ fn error_response(status: StatusCode, msg: &str) -> AxumResponse {
 
 // ── Listener bind ────────────────────────────────────────────────────────
 
-async fn serve_one(server: ServerConfig, router: Router) -> std::io::Result<()> {
-    let addr: SocketAddr = server
-        .listen
-        .parse()
-        .map_err(|e: std::net::AddrParseError| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
-        })?;
-    let app = router.into_make_service_with_connect_info::<SocketAddr>();
+/// Backlog for each listener once it starts accepting (tokio's default).
+const LISTEN_BACKLOG: u32 = 1024;
 
-    if let Some(tls) = server.tls.as_ref() {
-        let config = build_rustls_config(tls).await?;
-        tracing::info!(target: "siphon_http", listen = %addr, tls = true, "binding HTTPS listener");
-        axum_server::bind_rustls(addr, config).serve(app).await?;
+/// A `servers[]` entry that failed to come up, and why.
+#[derive(Debug, thiserror::Error)]
+#[error("listener {listen}: {source}")]
+pub(crate) struct ListenerError {
+    listen: String,
+    source: std::io::Error,
+}
+
+/// Whether listeners that failed to bind must stop the process. A listener
+/// with no route behind it serves nothing but 404, so its loss is only an
+/// error; once a route exists, losing a listener makes that route unreachable.
+fn listener_failures_are_fatal(route_count: usize, failures: usize) -> bool {
+    route_count > 0 && failures > 0
+}
+
+/// A socket bound to its address but not yet listening, plus its TLS config.
+///
+/// Splitting `bind` from `listen` surfaces a port conflict at startup while
+/// still refusing connections until the `http.startup` hooks have finished, so
+/// a TCP readiness probe does not pass early.
+pub(crate) struct BoundListener {
+    listen: String,
+    socket: tokio::net::TcpSocket,
+    tls: Option<axum_server::tls_rustls::RustlsConfig>,
+}
+
+/// Parse the address, load any TLS material, and bind the socket.
+fn bind_listener(server: &ServerConfig) -> Result<BoundListener, ListenerError> {
+    let fail = |source| ListenerError {
+        listen: server.listen.clone(),
+        source,
+    };
+    let addr = server.socket_addr().map_err(|e| fail(to_io(e)))?;
+    let tls = server
+        .tls
+        .as_ref()
+        .map(build_rustls_config)
+        .transpose()
+        .map_err(fail)?;
+
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()
     } else {
-        tracing::info!(target: "siphon_http", listen = %addr, tls = false, "binding HTTP listener");
-        axum_server::bind(addr).serve(app).await?;
+        tokio::net::TcpSocket::new_v6()
     }
-    Ok(())
+    .map_err(fail)?;
+    // Same as std's TcpListener::bind: allow a restart while old connections
+    // sit in TIME_WAIT. Not on Windows, where it would allow port stealing.
+    #[cfg(unix)]
+    socket.set_reuseaddr(true).map_err(fail)?;
+    socket.bind(addr).map_err(fail)?;
+
+    Ok(BoundListener {
+        listen: server.listen.clone(),
+        socket,
+        tls,
+    })
+}
+
+impl BoundListener {
+    #[cfg(test)]
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    /// Start listening and serve `router` until the server stops.
+    async fn serve(self, router: Router) -> std::io::Result<()> {
+        let listener = self.socket.listen(LISTEN_BACKLOG)?.into_std()?;
+        let addr = listener.local_addr()?;
+        let app = router.into_make_service_with_connect_info::<SocketAddr>();
+
+        if let Some(config) = self.tls {
+            tracing::info!(target: "siphon_http", listen = %addr, tls = true, "serving HTTPS listener");
+            axum_server::from_tcp_rustls(listener, config)?
+                .serve(app)
+                .await?;
+        } else {
+            tracing::info!(target: "siphon_http", listen = %addr, tls = false, "serving HTTP listener");
+            axum_server::from_tcp(listener)?.serve(app).await?;
+        }
+        Ok(())
+    }
 }
 
 /// Build the TLS config for a listener.
@@ -485,9 +585,7 @@ async fn serve_one(server: ServerConfig, router: Router) -> std::io::Result<()> 
 /// when `client_ca` is set (mutual TLS), and advertises ALPN `h2, http/1.1` so
 /// HTTP/2 negotiates over TLS. Pins the ring crypto provider explicitly to
 /// avoid ambiguity when more than one provider is linked.
-async fn build_rustls_config(
-    tls: &TlsConfig,
-) -> std::io::Result<axum_server::tls_rustls::RustlsConfig> {
+fn build_rustls_config(tls: &TlsConfig) -> std::io::Result<axum_server::tls_rustls::RustlsConfig> {
     let certs = load_certs(&tls.cert_path)?;
     let key = load_key(&tls.key_path)?;
 
@@ -556,7 +654,11 @@ fn to_io<E: std::fmt::Display>(e: E) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_certs, load_key, pem_to_io, RustlsServerConfig};
+    use super::{
+        bind_listener, listener_failures_are_fatal, load_certs, load_key, pem_to_io,
+        RustlsServerConfig,
+    };
+    use crate::{ServerConfig, TlsConfig};
     use rustls::pki_types::pem;
     use rustls::pki_types::PrivateKeyDer;
     use std::io::ErrorKind;
@@ -790,5 +892,84 @@ GOGGj2W2oE4Z0ETjIVryRGzZgKSWuJOtFQ==\n\
         assert_eq!(certs.len(), 1);
         assert_eq!(certs[0].as_ref()[0], 0x30);
         assert!(certs[0].as_ref().len() > 300);
+    }
+
+    fn server(listen: &str) -> ServerConfig {
+        crate::HttpConfig::from_yaml(&format!("servers:\n  - listen: \"{listen}\"\n"))
+            .unwrap()
+            .servers
+            .remove(0)
+    }
+
+    #[test]
+    fn bind_reports_a_port_already_in_use_with_the_address() {
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen = holder.local_addr().unwrap().to_string();
+        let error = match bind_listener(&server(&listen)) {
+            Ok(_) => panic!("second bind on {listen} succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.source.kind(), ErrorKind::AddrInUse);
+        assert!(error.to_string().contains(&listen), "{error}");
+    }
+
+    #[test]
+    fn bind_reports_an_unparsable_address_built_in_code() {
+        // from_yaml rejects this; a config built directly must fail at bind too.
+        let mut config = server("127.0.0.1:0");
+        config.listen = "127.0.0.1:${HTTP_PORT}".to_string();
+        let error = match bind_listener(&config) {
+            Ok(_) => panic!("unparsable address bound"),
+            Err(error) => error,
+        };
+        assert_eq!(error.source.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("${HTTP_PORT}"), "{error}");
+    }
+
+    #[test]
+    fn bind_reports_a_missing_tls_certificate() {
+        let mut config = server("127.0.0.1:0");
+        config.tls = Some(TlsConfig {
+            cert_path: "/nonexistent/siphon-http/server.crt".to_string(),
+            key_path: "/nonexistent/siphon-http/server.key".to_string(),
+            client_ca: None,
+        });
+        let error = match bind_listener(&config) {
+            Ok(_) => panic!("listener bound without its certificate"),
+            Err(error) => error,
+        };
+        assert_eq!(error.source.kind(), ErrorKind::NotFound);
+        assert!(error.to_string().contains("server.crt"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_bound_listener_accepts_nothing_until_it_serves() {
+        // Startup hooks run between bind and serve; readiness probes must not
+        // see an open socket in that window.
+        let bound = bind_listener(&server("127.0.0.1:0")).unwrap();
+        let addr = bound.local_addr().unwrap();
+        let refused = tokio::net::TcpStream::connect(addr).await.unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::ConnectionRefused);
+
+        let router = axum::Router::new().route("/ping", axum::routing::get(|| async { "pong" }));
+        tokio::spawn(async move { bound.serve(router).await });
+
+        let mut body = None;
+        for _ in 0..50 {
+            if let Ok(response) = reqwest::get(format!("http://{addr}/ping")).await {
+                body = Some(response.text().await.unwrap());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(body.as_deref(), Some("pong"));
+    }
+
+    #[test]
+    fn a_failed_listener_is_fatal_only_when_routes_need_it() {
+        assert!(listener_failures_are_fatal(1, 1));
+        assert!(listener_failures_are_fatal(3, 2));
+        assert!(!listener_failures_are_fatal(0, 1));
+        assert!(!listener_failures_are_fatal(2, 0));
     }
 }

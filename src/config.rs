@@ -14,6 +14,7 @@
 //! the `extensions.http` value is a path string. See [`HttpConfig`].
 
 use std::collections::HashMap;
+use std::net::{AddrParseError, SocketAddr};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -64,6 +65,14 @@ pub struct ServerConfig {
     /// reported to scripts as the client address. Empty = socket peer only.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+}
+
+impl ServerConfig {
+    /// `listen` as a socket address. Checked when the config is loaded, and
+    /// again when the listener binds, for callers that build a config in code.
+    pub fn socket_addr(&self) -> Result<SocketAddr, AddrParseError> {
+        self.listen.parse()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -135,6 +144,15 @@ pub enum ConfigError {
         path: String,
         source: serde_yaml::Error,
     },
+    #[error(
+        "{path}: servers[{index}].listen {listen:?} is not an IP:port socket address: {source}"
+    )]
+    Listen {
+        path: String,
+        index: usize,
+        listen: String,
+        source: AddrParseError,
+    },
 }
 
 impl HttpConfig {
@@ -144,18 +162,98 @@ impl HttpConfig {
             path: path.display().to_string(),
             source,
         })?;
-        serde_yaml::from_str(&raw).map_err(|source| ConfigError::Parse {
-            path: path.display().to_string(),
-            source,
-        })
+        Self::parse(&raw, &path.display().to_string())
     }
 
     /// Parse config from a YAML string (used by tests/benches and callers that
     /// already have the document in memory).
     pub fn from_yaml(s: &str) -> Result<Self, ConfigError> {
-        serde_yaml::from_str(s).map_err(|source| ConfigError::Parse {
-            path: "<str>".to_string(),
+        Self::parse(s, "<str>")
+    }
+
+    /// Deserialize, then reject any listener address that cannot bind, so a
+    /// typo is a load error rather than a listener that never comes up.
+    fn parse(raw: &str, path: &str) -> Result<Self, ConfigError> {
+        let config: Self = serde_yaml::from_str(raw).map_err(|source| ConfigError::Parse {
+            path: path.to_string(),
             source,
-        })
+        })?;
+        for (index, server) in config.servers.iter().enumerate() {
+            server.socket_addr().map_err(|source| ConfigError::Listen {
+                path: path.to_string(),
+                index,
+                listen: server.listen.clone(),
+                source,
+            })?;
+        }
+        Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfigError, HttpConfig};
+
+    #[test]
+    fn unparsable_listen_is_a_config_error_naming_the_value() {
+        // The shape an unexpanded `${VAR}` placeholder leaves behind.
+        let error =
+            HttpConfig::from_yaml("servers:\n  - listen: \"127.0.0.1:${HTTP_PORT:-8090}\"\n")
+                .unwrap_err();
+        assert!(matches!(error, ConfigError::Listen { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(
+            message.contains("127.0.0.1:${HTTP_PORT:-8090}"),
+            "{message}"
+        );
+        assert!(message.contains("servers[0]"), "{message}");
+    }
+
+    #[test]
+    fn listen_without_a_port_is_rejected() {
+        let error = HttpConfig::from_yaml("servers:\n  - listen: \"127.0.0.1\"\n").unwrap_err();
+        assert!(matches!(error, ConfigError::Listen { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn every_listener_is_checked_not_just_the_first() {
+        let error = HttpConfig::from_yaml(
+            "servers:\n  - listen: \"127.0.0.1:8080\"\n  - listen: \"localhost:8081\"\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("servers[1]"), "{error}");
+    }
+
+    #[test]
+    fn ipv4_and_ipv6_listen_addresses_load() {
+        let config = HttpConfig::from_yaml(
+            "servers:\n  - listen: \"0.0.0.0:8443\"\n  - listen: \"[::1]:8080\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.servers.len(), 2);
+        assert_eq!(config.servers[1].socket_addr().unwrap().port(), 8080);
+    }
+
+    #[test]
+    fn no_servers_is_valid() {
+        assert!(HttpConfig::from_yaml("clients: {}\n")
+            .unwrap()
+            .servers
+            .is_empty());
+    }
+
+    #[test]
+    fn from_file_validates_listen_too() {
+        let path =
+            std::env::temp_dir().join(format!("siphon-http-config-{}.yaml", std::process::id()));
+        std::fs::write(&path, "servers:\n  - listen: \"not-an-address\"\n").unwrap();
+        let result = HttpConfig::from_file(&path);
+        let _ = std::fs::remove_file(&path);
+        let error = result.unwrap_err();
+        assert!(matches!(error, ConfigError::Listen { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(path.to_str().unwrap()),
+            "{error}"
+        );
     }
 }

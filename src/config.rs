@@ -12,6 +12,9 @@
 //!
 //! The addon reads its own file; siphon's main config parser only cares that
 //! the `extensions.http` value is a path string. See [`HttpConfig`].
+//!
+//! The file's text goes through siphon's `${VAR}` / `${VAR:-default}`
+//! environment expansion before it is parsed, the same as `siphon.yaml`.
 
 use std::collections::HashMap;
 use std::net::{AddrParseError, SocketAddr};
@@ -171,13 +174,17 @@ impl HttpConfig {
         Self::parse(s, "<str>")
     }
 
-    /// Deserialize, then reject any listener address that cannot bind, so a
-    /// typo is a load error rather than a listener that never comes up.
+    /// Expand `${VAR}` / `${VAR:-default}` with siphon's own expander (so the
+    /// rules match `siphon.yaml` exactly), deserialize, then reject any
+    /// listener address that cannot bind, so a typo is a load error rather
+    /// than a listener that never comes up.
     fn parse(raw: &str, path: &str) -> Result<Self, ConfigError> {
-        let config: Self = serde_yaml::from_str(raw).map_err(|source| ConfigError::Parse {
-            path: path.to_string(),
-            source,
-        })?;
+        let expanded = siphon::config::expand_env_vars(raw);
+        let config: Self =
+            serde_yaml::from_str(&expanded).map_err(|source| ConfigError::Parse {
+                path: path.to_string(),
+                source,
+            })?;
         for (index, server) in config.servers.iter().enumerate() {
             server.socket_addr().map_err(|source| ConfigError::Listen {
                 path: path.to_string(),
@@ -196,16 +203,11 @@ mod tests {
 
     #[test]
     fn unparsable_listen_is_a_config_error_naming_the_value() {
-        // The shape an unexpanded `${VAR}` placeholder leaves behind.
         let error =
-            HttpConfig::from_yaml("servers:\n  - listen: \"127.0.0.1:${HTTP_PORT:-8090}\"\n")
-                .unwrap_err();
+            HttpConfig::from_yaml("servers:\n  - listen: \"127.0.0.1:http\"\n").unwrap_err();
         assert!(matches!(error, ConfigError::Listen { .. }), "{error:?}");
         let message = error.to_string();
-        assert!(
-            message.contains("127.0.0.1:${HTTP_PORT:-8090}"),
-            "{message}"
-        );
+        assert!(message.contains("127.0.0.1:http"), "{message}");
         assert!(message.contains("servers[0]"), "{message}");
     }
 
@@ -232,6 +234,54 @@ mod tests {
         .unwrap();
         assert_eq!(config.servers.len(), 2);
         assert_eq!(config.servers[1].socket_addr().unwrap().port(), 8080);
+    }
+
+    // Each test uses its own variable name: tests run in parallel and share
+    // the process environment.
+
+    #[test]
+    fn unset_variable_takes_its_default() {
+        let config = HttpConfig::from_yaml(
+            "servers:\n  - listen: \"127.0.0.1:${SIPHON_HTTP_TEST_UNSET_PORT:-8090}\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.servers[0].listen, "127.0.0.1:8090");
+    }
+
+    #[test]
+    fn set_variable_overrides_the_default() {
+        std::env::set_var("SIPHON_HTTP_TEST_SET_PORT", "18443");
+        let config = HttpConfig::from_yaml(
+            "servers:\n  - listen: \"0.0.0.0:${SIPHON_HTTP_TEST_SET_PORT:-8443}\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.servers[0].socket_addr().unwrap().port(), 18443);
+    }
+
+    #[test]
+    fn expansion_covers_every_string_value() {
+        std::env::set_var("SIPHON_HTTP_TEST_TLS_DIR", "/etc/siphon/tls");
+        std::env::set_var("SIPHON_HTTP_TEST_API", "https://api.example.com");
+        let config = HttpConfig::from_yaml(
+            "servers:\n  - listen: \"127.0.0.1:8443\"\n    tls:\n      cert_path: \"${SIPHON_HTTP_TEST_TLS_DIR}/server.crt\"\n      key_path: \"${SIPHON_HTTP_TEST_TLS_DIR}/server.key\"\nclients:\n  api:\n    base_url: \"${SIPHON_HTTP_TEST_API}\"\n",
+        )
+        .unwrap();
+        let tls = config.servers[0].tls.as_ref().unwrap();
+        assert_eq!(tls.cert_path, "/etc/siphon/tls/server.crt");
+        assert_eq!(tls.key_path, "/etc/siphon/tls/server.key");
+        assert_eq!(
+            config.clients["api"].base_url.as_deref(),
+            Some("https://api.example.com")
+        );
+    }
+
+    #[test]
+    fn unset_variable_without_default_leaves_an_invalid_listen_rejected() {
+        let error = HttpConfig::from_yaml(
+            "servers:\n  - listen: \"127.0.0.1:${SIPHON_HTTP_TEST_NEVER_SET}\"\n",
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigError::Listen { .. }), "{error:?}");
     }
 
     #[test]

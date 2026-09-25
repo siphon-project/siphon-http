@@ -50,13 +50,20 @@ once.
 
 | Key | Type | Description |
 |---|---|---|
-| `listen` | string | Bind address as `host:port` (e.g. `0.0.0.0:8443`, `127.0.0.1:9090`). |
+| `listen` | string | Bind address as an IP literal and port (e.g. `0.0.0.0:8443`, `127.0.0.1:9090`, `[::]:8443`). Hostnames are not resolved. |
 | `tls` | map | Optional. Present → the listener terminates TLS. Absent → plain HTTP. See [TLS](#tls-termination). |
 | `max_body_bytes` | int | Optional. Cap on the buffered request body. A larger body is rejected with `413 Payload Too Large`. |
 | `request_timeout_ms` | int | Optional. Per-request time budget in milliseconds. |
 
 HTTP/1.1 and HTTP/2 are both served on every listener automatically — there is
 no per-listener switch. See [HTTP/2](#http2).
+
+A `listen` value that is not an IP address and port is rejected when the file
+is loaded. Every listener is then bound at startup, before `@http.on_startup`
+runs, and only starts accepting once those hooks finish. If any listener cannot
+bind (port in use, missing or unreadable TLS file) and the script registered at
+least one `@http.route`, siphon exits with an error instead of running with
+routes nobody can reach.
 
 ### TLS termination
 

@@ -5,6 +5,41 @@ All notable changes to `siphon-http` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [1.1.0] — 2026-09-25
+
+### Fixed
+
+- **`${VAR}` / `${VAR:-default}` expansion in `http.yaml` now actually happens.**
+  The docs promised it but the loader handed the raw text to the YAML parser,
+  so e.g. `listen: "0.0.0.0:${HTTP_PORT:-8443}"` failed at bind. The file is now
+  expanded with siphon's own expander (`siphon::config::expand_env_vars`), so
+  the rules are exactly those of `siphon.yaml`.
+- **A listener that cannot bind no longer leaves the process running without
+  it.** Listeners are now bound at startup, before `@http.on_startup`, instead
+  of in a background task after it. If one fails (port in use, missing TLS
+  file) and the script registered routes, the process exits with an error,
+  matching how siphon treats a SIP listener it cannot bind. Previously this was
+  one `listener failed` log line while the routes sat unreachable behind an
+  otherwise healthy process. Sockets still accept nothing until the startup
+  hooks finish, so TCP readiness probes keep their meaning.
+- **`servers[].listen` is validated at config load.** A value that is not an IP
+  address and port is a `ConfigError::Listen` naming the entry, rather than a
+  runtime `invalid socket address syntax`.
+
+### Changed
+
+- `ConfigError` has a new `Listen` variant; an exhaustive `match` on it needs
+  an extra arm.
+- `siphon-sip` moves to current `main` for `siphon::config::expand_env_vars`.
+
+### Security
+
+- **Cargo.lock refresh** for RUSTSEC-2026-0258 (h2 0.4.19, unbounded empty
+  DATA frames) and RUSTSEC-2026-0285 (rustls 0.23.45, TLS 1.3 handshake
+  messages accepted across encryption levels), plus the yanked chacha20 0.10.1.
+
 ## [1.0.2] — 2026-08-18
 
 ### Added

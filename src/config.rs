@@ -47,6 +47,13 @@ pub struct ServerConfig {
     /// `host:port`, e.g. `"0.0.0.0:443"`.
     pub listen: String,
 
+    /// A name for this listener, which a route names to be served on it alone
+    /// (`@http.route(path, listeners=["internal"])`) and a handler reads as
+    /// `req.listener.name`. Without one the listener is known by its `listen`
+    /// value. Names are unique across `servers`.
+    #[serde(default)]
+    pub name: Option<String>,
+
     /// Optional TLS config. Without it, the server speaks plain HTTP — fine
     /// for a localhost-only metrics endpoint, never for external listeners.
     #[serde(default)]
@@ -75,6 +82,12 @@ impl ServerConfig {
     /// again when the listener binds, for callers that build a config in code.
     pub fn socket_addr(&self) -> Result<SocketAddr, AddrParseError> {
         self.listen.parse()
+    }
+
+    /// What routes and handlers call this listener: its `name`, or else its
+    /// `listen` value.
+    pub fn listener_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.listen)
     }
 }
 
@@ -156,6 +169,12 @@ pub enum ConfigError {
         listen: String,
         source: AddrParseError,
     },
+    #[error("{path}: servers[{index}] is called {name:?}, and so is an earlier listener")]
+    ListenerName {
+        path: String,
+        index: usize,
+        name: String,
+    },
 }
 
 impl HttpConfig {
@@ -192,6 +211,20 @@ impl HttpConfig {
                 listen: server.listen.clone(),
                 source,
             })?;
+            // A route restricted to a listener names it; two listeners of one
+            // name would make that ambiguous.
+            let name = server.listener_name();
+            if config.servers[..index].iter().any(|earlier| {
+                // Two unnamed entries with one address are left to fail at
+                // bind, as they always did.
+                (server.name.is_some() || earlier.name.is_some()) && earlier.listener_name() == name
+            }) {
+                return Err(ConfigError::ListenerName {
+                    path: path.to_string(),
+                    index,
+                    name: name.to_string(),
+                });
+            }
         }
         Ok(config)
     }
@@ -209,6 +242,30 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("127.0.0.1:http"), "{message}");
         assert!(message.contains("servers[0]"), "{message}");
+    }
+
+    #[test]
+    fn a_listener_is_known_by_its_name_or_else_its_listen_value() {
+        let config = HttpConfig::from_yaml(
+            "servers:\n  - listen: \"127.0.0.1:8080\"\n  - listen: \"127.0.0.1:8443\"\n    name: internal\n",
+        )
+        .unwrap();
+        assert_eq!(config.servers[0].name, None);
+        assert_eq!(config.servers[0].listener_name(), "127.0.0.1:8080");
+        assert_eq!(config.servers[1].listener_name(), "internal");
+    }
+
+    #[test]
+    fn two_listeners_of_one_name_are_a_config_error() {
+        for yaml in [
+            "servers:\n  - listen: \"127.0.0.1:8080\"\n    name: api\n  - listen: \"127.0.0.1:8081\"\n    name: api\n",
+            // A name that is another listener's address.
+            "servers:\n  - listen: \"127.0.0.1:8080\"\n  - listen: \"127.0.0.1:8081\"\n    name: \"127.0.0.1:8080\"\n",
+        ] {
+            let error = HttpConfig::from_yaml(yaml).unwrap_err();
+            assert!(matches!(error, ConfigError::ListenerName { .. }), "{error:?}");
+            assert!(error.to_string().contains("servers[1]"), "{error}");
+        }
     }
 
     #[test]

@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+use crate::connection::{ConnectionInfo, Listener, TlsInfo};
+
 #[pyclass(module = "siphon", name = "Request")]
 pub struct Request {
     #[pyo3(get)]
@@ -39,6 +41,17 @@ pub struct Request {
     /// Remote socket address as `ip:port`.
     #[pyo3(get)]
     pub client: String,
+
+    /// The host the client addressed: the authority of the request target
+    /// (the `:authority` of an HTTP/2 request), or else the `Host` header.
+    /// `None` when the request has neither. An HTTP/2 request need not carry
+    /// a `Host` header, so read the name from here, not from `headers`.
+    #[pyo3(get)]
+    pub host: Option<String>,
+
+    /// The listener and TLS session of the connection, when the request came
+    /// through one of the addon's listeners.
+    pub(crate) connection: Option<ConnectionInfo>,
 }
 
 #[pymethods]
@@ -53,6 +66,22 @@ impl Request {
     /// Convenience: header by name, case-insensitive. Returns None if absent.
     fn header(&self, name: &str) -> Option<String> {
         self.headers.get(&name.to_ascii_lowercase()).cloned()
+    }
+
+    /// The TLS session of the connection this request arrived on, or `None`
+    /// on a cleartext listener. See [`TlsInfo`].
+    #[getter]
+    fn tls(&self) -> Option<TlsInfo> {
+        self.connection
+            .as_ref()
+            .and_then(|connection| connection.tls.clone())
+            .map(TlsInfo::new)
+    }
+
+    /// The listener this request arrived on. See [`Listener`].
+    #[getter]
+    fn listener(&self) -> Option<Listener> {
+        self.connection.clone().map(Listener::new)
     }
 
     fn __repr__(&self) -> String {
@@ -73,6 +102,8 @@ impl Request {
         headers: HashMap<String, String>,
         body_bytes: Vec<u8>,
         client: String,
+        host: Option<String>,
+        connection: Option<ConnectionInfo>,
     ) -> Self {
         Self {
             method,
@@ -82,6 +113,8 @@ impl Request {
             headers,
             body_bytes,
             client,
+            host,
+            connection,
         }
     }
 }

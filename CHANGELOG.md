@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The namespace no longer hides the standard library's `http` package.** The
+  module was created under the name `http`, which put it in `sys.modules` in
+  place of the standard library package for the whole interpreter. Any script
+  module that imported `http.client`, `urllib.request`, `xml.sax.saxutils` or
+  another user of them failed with `No module named 'http.client'; 'http' is
+  not a package`. The module is now named `siphon.http` and is registered
+  under that name only. `from siphon import http` is unchanged. A bare
+  `import http` in a script, which was never documented, now gives the
+  standard library package and not the namespace.
+
 ## [1.1.0] — 2026-09-25
 
 ### Fixed

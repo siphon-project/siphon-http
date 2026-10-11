@@ -34,8 +34,17 @@ pub fn namespace(
 ) -> impl FnOnce(Python<'_>) -> PyResult<Py<PyAny>> + Send + 'static {
     move |py| {
         let source = CString::new(NAMESPACE_SOURCE).expect("python/http.py contains no NUL bytes");
-        let module =
-            PyModule::from_code(py, source.as_c_str(), c"siphon_http/__init__.py", c"http")?;
+        // The module name is what CPython files the module under in
+        // `sys.modules`. It is `siphon.http`, never the bare `http`: that is
+        // the standard library's package, and a module of that name hides
+        // `http.client` from `urllib.request`, `xml.sax.saxutils` and every
+        // other importer in the interpreter.
+        let module = PyModule::from_code(
+            py,
+            source.as_c_str(),
+            c"siphon_http/__init__.py",
+            c"siphon.http",
+        )?;
 
         let cfg_dict = PyDict::new(py);
         let listens = PyList::new(py, cfg.servers.iter().map(|s| s.listen.clone()))?;

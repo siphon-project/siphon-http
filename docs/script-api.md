@@ -6,6 +6,10 @@ Everything you use from a routing script lives under the `http` namespace:
 from siphon import http, log
 ```
 
+Import it that way. The module is `siphon.http`; the bare name `http` is the
+standard library's package (`http.client`, `http.server`), which stays
+importable from a script and from anything the script imports.
+
 The namespace gives you three decorators for registering handlers —
 `@http.route`, `@http.middleware`, `@http.on_startup` — and three objects your
 handlers work with — `http.Request`, `http.Response`, and `http.Client`.

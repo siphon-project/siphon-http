@@ -120,7 +120,11 @@ class Request:
         path_params:  dict[str, str] -- extracted from the matched route
         query_params: dict[str, str]
         headers:      lowercase-keyed dict
-        client:       remote socket address as "ip:port"
+        client:       remote address as "ip:port": the socket peer, or the
+                      left-most X-Forwarded-For entry when the socket peer
+                      is a trusted proxy
+        peer:         the TCP peer of the connection as "ip:port", never
+                      taken from a header
         host:         the host the client addressed: the `:authority` of an
                       HTTP/2 request, or else the Host header; None if neither
         listener:     the listener the request arrived on, with `name`,
@@ -130,9 +134,9 @@ class Request:
                       `cipher_suite` (IANA name), `cipher_suite_id` (int),
                       `cipher_suite_bytes` (two octets), `server_name` (SNI),
                       `alpn`, `peer_verified`, `peer_certificate` and
-                      `peer_certificates`; a certificate has `subject`
-                      (RFC 4514), `subject_alt_names` ((kind, value) tuples),
-                      `fingerprint_sha256` (hex) and `der`
+                      `peer_certificates`; a certificate has `subject` and
+                      `issuer` (RFC 4514), `subject_alt_names` ((kind, value)
+                      tuples), `fingerprint_sha256` (hex) and `der`
 
     Methods:
         req.body() -> bytes              (body is buffered)
@@ -145,6 +149,7 @@ class Request:
     query_params: dict
     headers: dict
     client: str
+    peer: str
     host: object
     listener: object
     tls: object

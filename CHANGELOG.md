@@ -14,11 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (the IANA registry name, `"TLS_AES_128_GCM_SHA256"`), `cipher_suite_id`
   (`0x1301`), `cipher_suite_bytes` (the two octets), `server_name` (SNI),
   `alpn`, and the client's certificate chain as `peer_certificate` /
-  `peer_certificates`, each with `subject` (RFC 4514), `subject_alt_names`
-  (`(kind, value)` tuples), `fingerprint_sha256` and `der`. `peer_verified`
-  says whether a chain verified against `client_ca`. A handler can now bind a
-  key to the negotiated cipher suite and a peer to the name in its
-  certificate, where before it had the source address only.
+  `peer_certificates`, each with `subject` and `issuer` (RFC 4514),
+  `subject_alt_names` (`(kind, value)` tuples), `fingerprint_sha256` and
+  `der`. `peer_verified` says whether a chain verified against `client_ca`. A
+  handler can now bind a key to the negotiated cipher suite and a peer to the
+  name in its certificate, where before it had the source address only.
 - **`req.listener`: the listener a request arrived on**, with `name`, `address`
   (the local end of the connection), `port` and `tls`.
 - **`servers[].name` and `@http.route(..., listeners=[...])`.** A route that
@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a path no route has. Without `listeners` a route is served on every listener,
   as before. A route naming a listener that is not configured stops siphon at
   startup; two listeners of one name are a load error.
+- **`req.peer`: the TCP peer of the connection** as `"ip:port"`. Unlike
+  `req.client` it never follows `X-Forwarded-For`, so behind a trusted proxy
+  it still names the host that completed the handshake.
 - **`req.host`**: the `:authority` of an HTTP/2 request, or else the `Host`
   header. An HTTP/2 request has no `Host` header in `req.headers`.
 

@@ -112,7 +112,8 @@ The inbound request, passed as the only argument to handlers and middleware.
 | `path_params` | `dict[str, str]` | Values extracted from the matched route, URL-decoded. |
 | `query_params` | `dict[str, str]` | Parsed query string. |
 | `headers` | `dict` | Lowercase-keyed headers. |
-| `client` | `str` | Remote socket address as `"ip:port"`. |
+| `client` | `str` | Remote address as `"ip:port"`: the socket peer, or the left-most `X-Forwarded-For` entry when the socket peer is a trusted proxy. |
+| `peer` | `str` | The TCP peer of the connection as `"ip:port"`. Never taken from a header, so it is the host that completed the TLS handshake even behind a trusted proxy. |
 | `host` | `str \| None` | The host the client addressed: the `:authority` of an HTTP/2 request, or else the `Host` header. An HTTP/2 request need not have a `Host` header, so read the name here. |
 | `listener` | `Listener` | The listener the request arrived on. See below. |
 | `tls` | `TlsInfo \| None` | The TLS session of the connection, `None` on a cleartext listener. See below. |
@@ -153,7 +154,8 @@ async def list_items(req):
 | `peer_certificates` | `list[PeerCertificate]` | The chain as presented, the client's certificate first. |
 
 A `PeerCertificate` has `subject` (an RFC 4514 string,
-`"CN=naf.example.com,O=Example,C=XX"`), `subject_alt_names` (a list of
+`"CN=naf.example.com,O=Example,C=XX"`), `issuer` (in the same form),
+`subject_alt_names` (a list of
 `(kind, value)` tuples with kind `"dns"`, `"uri"`, `"email"` or `"ip"`),
 `fingerprint_sha256` (64 lowercase hexadecimal digits) and `der` (the
 certificate, `bytes`).

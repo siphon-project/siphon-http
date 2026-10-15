@@ -76,7 +76,7 @@ pub(crate) fn named_client(name: &str) -> Option<ClientConfig> {
 
 static TRUSTED_PROXIES: OnceLock<Vec<IpAddr>> = OnceLock::new();
 
-fn set_trusted_proxies(entries: &[String]) {
+pub(crate) fn set_trusted_proxies(entries: &[String]) {
     let ips: Vec<IpAddr> = entries
         .iter()
         .filter_map(|e| match e.parse::<IpAddr>() {
@@ -585,6 +585,7 @@ pub(crate) fn request_from_parts(parts: &axum::http::request::Parts, body: Vec<u
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0);
     let client = client_addr(peer, &parts.headers);
+    let socket_peer = peer.map_or_else(|| "unknown:0".to_string(), |peer| peer.to_string());
     // An HTTP/2 request carries the name in `:authority`, which hyper puts in
     // the request target; HTTP/1.1 carries it in `Host`.
     let host = parts
@@ -601,6 +602,7 @@ pub(crate) fn request_from_parts(parts: &axum::http::request::Parts, body: Vec<u
         headers,
         body,
         client,
+        socket_peer,
         host,
         parts.extensions.get::<ConnectionInfo>().cloned(),
     )

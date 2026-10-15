@@ -294,6 +294,12 @@ async fn a_handler_sees_the_verified_client_certificate() {
     );
 
     let (_, body) = client
+        .probe(address, &format!("{certificate}.issuer"))
+        .await
+        .unwrap();
+    assert_eq!(body, "'CN=Example Test CA,O=Example Test'");
+
+    let (_, body) = client
         .probe(address, &format!("{certificate}.subject_alt_names"))
         .await
         .unwrap();
@@ -363,6 +369,23 @@ async fn a_handler_knows_the_listener_it_was_reached_on() {
             plain.port()
         )
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_peer_is_the_socket_even_behind_a_trusted_proxy() {
+    // 127.0.0.1 is a trusted proxy, so `client` follows X-Forwarded-For;
+    // `peer` must still name the host on the other end of the socket.
+    crate::runtime::set_trusted_proxies(&["127.0.0.1".to_string()]);
+    let plain = serve("servers:\n  - listen: \"127.0.0.1:0\"\n").await;
+    let mut stream = tokio::net::TcpStream::connect(plain).await.unwrap();
+    let local = stream.local_addr().unwrap();
+    let request = "GET /probe HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 203.0.113.9\r\nX-Probe: (req.client, req.peer)\r\nConnection: close\r\n\r\n";
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response = String::from_utf8_lossy(&response);
+    let body = response.split_once("\r\n\r\n").unwrap().1;
+    assert_eq!(body, format!("('203.0.113.9', '{local}')"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

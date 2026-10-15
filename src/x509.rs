@@ -1,17 +1,20 @@
 //! Just enough X.509 (RFC 5280) to tell a script whom a client certificate
-//! names: the subject and the subject alternative names.
+//! names: the subject, the issuer and the subject alternative names.
 //!
 //! This is not a validator. It only ever reads a certificate rustls has
 //! already verified against the listener's `client_ca`, and it makes no
-//! decision: it turns two fields into text. Anything it does not understand
+//! decision: it turns three fields into text. Anything it does not understand
 //! it leaves out, and a certificate it cannot walk yields `None`.
 
-/// The subject and the subject alternative names of one certificate.
+/// The subject, the issuer and the subject alternative names of one
+/// certificate.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Names {
     /// The subject as an RFC 4514 string, most specific RDN first:
     /// `CN=naf.example.com,O=Example,C=XX`.
     pub(crate) subject: String,
+    /// The issuer, in the same form as the subject.
+    pub(crate) issuer: String,
     /// `(kind, value)` with kind `dns`, `uri`, `email` or `ip`, in the order
     /// of the certificate.
     pub(crate) subject_alt_names: Vec<(&'static str, String)>,
@@ -69,7 +72,7 @@ fn expect<'a>(input: &mut &'a [u8], tag: u8) -> Option<&'a [u8]> {
     }
 }
 
-/// The subject and subject alternative names of a DER certificate.
+/// The subject, issuer and subject alternative names of a DER certificate.
 pub(crate) fn names(certificate: &[u8]) -> Option<Names> {
     let mut input = certificate;
     let mut certificate = expect(&mut input, SEQUENCE)?;
@@ -81,7 +84,7 @@ pub(crate) fn names(certificate: &[u8]) -> Option<Names> {
     }
     expect(&mut tbs, INTEGER)?; // serialNumber
     expect(&mut tbs, SEQUENCE)?; // signature
-    expect(&mut tbs, SEQUENCE)?; // issuer
+    let issuer = distinguished_name(expect(&mut tbs, SEQUENCE)?)?;
     expect(&mut tbs, SEQUENCE)?; // validity
     let subject = distinguished_name(expect(&mut tbs, SEQUENCE)?)?;
     expect(&mut tbs, SEQUENCE)?; // subjectPublicKeyInfo
@@ -109,6 +112,7 @@ pub(crate) fn names(certificate: &[u8]) -> Option<Names> {
     }
     Some(Names {
         subject,
+        issuer,
         subject_alt_names,
     })
 }
@@ -303,6 +307,15 @@ mod tests {
                 ("dns", "localhost".to_string()),
                 ("ip", "127.0.0.1".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn the_issuer_reads_like_openssl_prints_it() {
+        // `openssl x509 -noout -issuer -nameopt RFC2253`
+        assert_eq!(
+            names(&der(CLIENT)).unwrap().issuer,
+            "CN=Example Test CA,O=Example Test"
         );
     }
 

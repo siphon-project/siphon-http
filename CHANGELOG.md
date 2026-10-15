@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-10-15
+
 ### Added
 
 - **`req.tls`: the TLS session of the connection a request arrived on.** `None`
@@ -51,6 +53,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   under that name only. `from siphon import http` is unchanged. A bare
   `import http` in a script, which was never documented, now gives the
   standard library package and not the namespace.
+
+### Security
+
+- **rustls 0.23.46** for RUSTSEC-2026-0346 (`Debug` of client session values
+  printed TLS secrets), RUSTSEC-2026-0347 (application data sent to the outer
+  server after an ECH rejection), RUSTSEC-2026-0348 (brotli certificate
+  decompression could allocate up to 1 GiB before authentication) and
+  RUSTSEC-2026-0349 (an unauthenticated ServerHello could downgrade later
+  connections to classical key exchange).
 
 ## [1.1.0] — 2026-09-25
 

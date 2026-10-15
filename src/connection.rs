@@ -323,6 +323,13 @@ impl PeerCertificate {
             .map(|names| names.subject.as_str())
     }
 
+    /// The issuer as an RFC 4514 string, in the same form as `subject`.
+    /// `None` if the certificate could not be read.
+    #[getter]
+    fn issuer(&self) -> Option<&str> {
+        self.facts.names.as_ref().map(|names| names.issuer.as_str())
+    }
+
     /// The subject alternative names as `(kind, value)` tuples in the order
     /// of the certificate, with kind `"dns"`, `"uri"`, `"email"` or `"ip"`.
     #[getter]

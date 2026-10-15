@@ -55,8 +55,8 @@ extensions:
 | TLS termination | ✅ `tls: { cert_path, key_path }` |
 | Mutual TLS (client-cert) | ✅ `tls.client_ca` |
 | HTTP/2 | ✅ auto — h2c (cleartext, preface prior-knowledge) + h2 via ALPN on TLS, HTTP/1.1 on the same socket |
-| Client address | ✅ `req.client` (left-most `X-Forwarded-For` when the peer is a `trusted_proxies` IP) |
-| TLS session of the request | ✅ `req.tls`: version, cipher suite (IANA name and value), SNI, ALPN, the verified client certificate (subject, alternative names, SHA-256 fingerprint) |
+| Client address | ✅ `req.client` (left-most `X-Forwarded-For` when the peer is a `trusted_proxies` IP); `req.peer` is always the socket peer |
+| TLS session of the request | ✅ `req.tls`: version, cipher suite (IANA name and value), SNI, ALPN, the verified client certificate (subject, issuer, alternative names, SHA-256 fingerprint) |
 | Listener of the request | ✅ `req.listener` (name, local address, port, TLS or not) |
 | Routes on named listeners only | ✅ `servers[].name` + `@http.route(..., listeners=[…])`; `404` elsewhere |
 | Host of the request | ✅ `req.host` (`:authority` on HTTP/2, else `Host`) |

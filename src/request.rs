@@ -38,9 +38,16 @@ pub struct Request {
     /// Body bytes. Buffered server-side subject to `max_body_bytes`.
     pub(crate) body_bytes: Vec<u8>,
 
-    /// Remote socket address as `ip:port`.
+    /// Remote address as `ip:port`: the socket peer, or the left-most
+    /// `X-Forwarded-For` entry when the socket peer is a trusted proxy.
     #[pyo3(get)]
     pub client: String,
+
+    /// The TCP peer of the connection as `ip:port`. Never taken from a
+    /// header, so unlike `client` it is the host that completed the
+    /// handshake.
+    #[pyo3(get)]
+    pub peer: String,
 
     /// The host the client addressed: the authority of the request target
     /// (the `:authority` of an HTTP/2 request), or else the `Host` header.
@@ -102,6 +109,7 @@ impl Request {
         headers: HashMap<String, String>,
         body_bytes: Vec<u8>,
         client: String,
+        peer: String,
         host: Option<String>,
         connection: Option<ConnectionInfo>,
     ) -> Self {
@@ -113,6 +121,7 @@ impl Request {
             headers,
             body_bytes,
             client,
+            peer,
             host,
             connection,
         }

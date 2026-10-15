@@ -19,7 +19,7 @@ outbound `http.Client` call, a cache lookup); it keeps the loop free.
 
 ## Decorators
 
-### `@http.route(path, methods=None)`
+### `@http.route(path, methods=None, listeners=None)`
 
 Registers a handler for a route. The handler receives a single
 [`Request`](#httprequest) and must return a [`Response`](#httpresponse) —
@@ -45,6 +45,11 @@ async def order(req):
 - **`methods`** is a list of HTTP method strings; the default is `["GET"]`.
   Methods are upper-cased for you. A route with several methods dispatches to the
   same handler — branch on `req.method`.
+- **`listeners`** is a list of listener names (`servers[].name` in
+  `http.yaml`, or the `listen` value of an entry without a name). The route is
+  served on those listeners only and answers `404` on any other. The default
+  serves it on every listener. See
+  [Routes on one listener](configuration.md#routes-on-one-listener).
 
 ### `@http.middleware`
 
@@ -108,6 +113,9 @@ The inbound request, passed as the only argument to handlers and middleware.
 | `query_params` | `dict[str, str]` | Parsed query string. |
 | `headers` | `dict` | Lowercase-keyed headers. |
 | `client` | `str` | Remote socket address as `"ip:port"`. |
+| `host` | `str \| None` | The host the client addressed: the `:authority` of an HTTP/2 request, or else the `Host` header. An HTTP/2 request need not have a `Host` header, so read the name here. |
+| `listener` | `Listener` | The listener the request arrived on. See below. |
+| `tls` | `TlsInfo \| None` | The TLS session of the connection, `None` on a cleartext listener. See below. |
 
 | Method | Returns | Description |
 |---|---|---|
@@ -120,6 +128,53 @@ async def list_items(req):
     limit = int(req.query_params.get("limit", "100"))
     ...
 ```
+
+### `req.listener`
+
+| Attribute | Type | Description |
+|---|---|---|
+| `name` | `str` | `servers[].name`, or the `listen` value of an entry without a name. |
+| `address` | `str` | The local end of the connection as `"ip:port"`. On a listener bound to `0.0.0.0` this is the address the client reached. |
+| `port` | `int` | The local port. |
+| `tls` | `bool` | Whether the listener terminates TLS. |
+
+### `req.tls`
+
+| Attribute | Type | Description |
+|---|---|---|
+| `version` | `str` | `"TLSv1.3"` or `"TLSv1.2"`. |
+| `cipher_suite` | `str` | The negotiated suite by its name in the IANA TLS Cipher Suite Registry, e.g. `"TLS_AES_128_GCM_SHA256"`. |
+| `cipher_suite_id` | `int` | Its registry value, e.g. `0x1301`. |
+| `cipher_suite_bytes` | `bytes` | The value as its two octets, e.g. `b"\x13\x01"`. |
+| `server_name` | `str \| None` | The name the client asked for (SNI). |
+| `alpn` | `str \| None` | The negotiated application protocol, `"h2"` or `"http/1.1"`; `None` when the client offered none. |
+| `peer_verified` | `bool` | Whether the client presented a certificate chain that verified against the listener's `client_ca`. Always `True` on a listener with `client_ca`, `False` without. |
+| `peer_certificate` | `PeerCertificate \| None` | The client's own certificate. |
+| `peer_certificates` | `list[PeerCertificate]` | The chain as presented, the client's certificate first. |
+
+A `PeerCertificate` has `subject` (an RFC 4514 string,
+`"CN=naf.example.com,O=Example,C=XX"`), `subject_alt_names` (a list of
+`(kind, value)` tuples with kind `"dns"`, `"uri"`, `"email"` or `"ip"`),
+`fingerprint_sha256` (64 lowercase hexadecimal digits) and `der` (the
+certificate, `bytes`).
+
+```python
+ALLOWED = {"naf.example.com"}
+
+@http.route("/internal/keys", methods=["POST"], listeners=["internal"])
+async def keys(req):
+    certificate = req.tls.peer_certificate if req.tls else None
+    names = {value for kind, value in certificate.subject_alt_names
+             if kind == "dns"} if certificate else set()
+    if not names & ALLOWED:
+        return http.Response(status=403)
+    suite = req.tls.cipher_suite_bytes      # e.g. for a key bound to the suite
+    ...
+```
+
+The subject and the alternative names are read from a certificate rustls has
+already verified; siphon-http compares nothing itself. Which names are allowed
+is the script's decision.
 
 ## `http.Response`
 

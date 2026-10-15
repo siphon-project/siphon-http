@@ -46,6 +46,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
 use crate::config::ClientConfig;
+use crate::connection::{ConnectionInfo, ListenerIdentity, PlainAcceptor, Sha256, TlsAcceptor};
 use crate::parse::{extract_path_params, parse_query};
 use crate::{HttpConfig, Request as PyRequest, Response as PyResponse, ServerConfig, TlsConfig};
 
@@ -169,7 +170,30 @@ pub fn spawn(cfg: HttpConfig, script: ScriptHandle) {
     }
 
     let route_count = routes.len();
-    let router = build_router(routes, Arc::clone(&middlewares), &cfg, script.clone());
+    let (router, scopes) = build_router(routes, Arc::clone(&middlewares), &cfg, script.clone());
+
+    // A route restricted to a listener no `servers[]` entry has would be
+    // served nowhere. That is a typo in the script or the config, and fatal
+    // for the same reason a listener that cannot bind is.
+    let unknown = unknown_route_listeners(
+        scopes.iter().map(|(path, scope)| (path.as_str(), scope)),
+        &cfg,
+    );
+    if !unknown.is_empty() {
+        for (path, name) in &unknown {
+            tracing::error!(
+                target: "siphon_http",
+                route = %path,
+                listener = %name,
+                "http route names a listener that is not configured"
+            );
+            eprintln!(
+                "siphon-http: route {path} is restricted to listener {name:?}, \
+                 which no servers[] entry is called; refusing to start"
+            );
+        }
+        std::process::exit(1);
+    }
 
     let mut bound = Vec::new();
     let mut failures = 0;
@@ -228,20 +252,37 @@ fn build_router(
     middlewares: Arc<Vec<HandlerHandle>>,
     cfg: &HttpConfig,
     script: ScriptHandle,
-) -> Router {
-    let mut by_path: HashMap<String, Vec<(Vec<Method>, HandlerHandle)>> = HashMap::new();
+) -> (Router, Vec<(String, RouteScope)>) {
+    let mut by_path: HashMap<String, Vec<RouteEntry>> = HashMap::new();
 
     for handler in routes {
-        let (path, methods) = Python::attach(|py| read_route_options(py, &handler))
-            .unwrap_or_else(|e| {
+        let options = match Python::attach(|py| read_route_options(py, &handler)) {
+            Ok(options) => options,
+            Err(e) => {
                 tracing::warn!(target: "siphon_http", error = %e, "skipping malformed http.route options");
-                ("".to_string(), Vec::new())
-            });
-        if path.is_empty() {
+                continue;
+            }
+        };
+        if options.path.is_empty() {
             continue;
         }
-        by_path.entry(path).or_default().push((methods, handler));
+        by_path.entry(options.path).or_default().push(RouteEntry {
+            scope: RouteScope {
+                methods: options.methods,
+                listeners: options.listeners,
+            },
+            handler,
+        });
     }
+
+    let scopes: Vec<(String, RouteScope)> = by_path
+        .iter()
+        .flat_map(|(path, entries)| {
+            entries
+                .iter()
+                .map(move |entry| (path.clone(), entry.scope.clone()))
+        })
+        .collect();
 
     let mut router = Router::new();
     for (path, entries) in by_path {
@@ -268,18 +309,35 @@ fn build_router(
         .map(|s| s.request_timeout_ms)
         .max()
         .unwrap_or(30_000);
-    router
-        .layer(RequestBodyLimitLayer::new(max_body))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::GATEWAY_TIMEOUT,
-            Duration::from_millis(timeout),
-        ))
+    let router =
+        router
+            .layer(RequestBodyLimitLayer::new(max_body))
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::GATEWAY_TIMEOUT,
+                Duration::from_millis(timeout),
+            ));
+    (router, scopes)
 }
 
-fn read_route_options(py: Python<'_>, handler: &HandlerHandle) -> PyResult<(String, Vec<Method>)> {
+/// What `@http.route(...)` registered for one handler.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RouteOptions {
+    pub(crate) path: String,
+    pub(crate) methods: Vec<Method>,
+    /// `listeners=[...]`: the listeners this route is served on. `None` is
+    /// every listener.
+    pub(crate) listeners: Option<Vec<String>>,
+}
+
+fn read_route_options(py: Python<'_>, handler: &HandlerHandle) -> PyResult<RouteOptions> {
     let opts = handler
         .options(py)
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("http.route missing options"))?;
+    route_options(&opts)
+}
+
+/// Read the options dict `python/http.py` registers with a route.
+pub(crate) fn route_options(opts: &Bound<'_, pyo3::types::PyDict>) -> PyResult<RouteOptions> {
     let path: String = opts
         .get_item("path")?
         .ok_or_else(|| {
@@ -296,11 +354,102 @@ fn read_route_options(py: Python<'_>, handler: &HandlerHandle) -> PyResult<(Stri
         .into_iter()
         .filter_map(|m| Method::from_bytes(m.as_bytes()).ok())
         .collect();
-    Ok((path, methods))
+    // Absent from the options of a script written before listeners existed.
+    let listeners = match opts.get_item("listeners")? {
+        Some(value) if !value.is_none() => Some(value.extract::<Vec<String>>()?),
+        _ => None,
+    };
+    Ok(RouteOptions {
+        path,
+        methods,
+        listeners,
+    })
+}
+
+/// Where one `@http.route` handler applies: its methods, and the listeners it
+/// is restricted to, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RouteScope {
+    pub(crate) methods: Vec<Method>,
+    pub(crate) listeners: Option<Vec<String>>,
+}
+
+impl RouteScope {
+    /// Whether the route exists on the listener a request arrived on. A
+    /// restricted route does not exist for a request whose listener is not
+    /// known.
+    fn serves_listener(&self, listener: Option<&str>) -> bool {
+        match (&self.listeners, listener) {
+            (None, _) => true,
+            (Some(allowed), Some(name)) => allowed.iter().any(|entry| entry == name),
+            (Some(_), None) => false,
+        }
+    }
+}
+
+struct RouteEntry {
+    scope: RouteScope,
+    handler: HandlerHandle,
+}
+
+/// What a path's handlers make of one request.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RouteMatch {
+    /// The handler at this index serves it.
+    Handler(usize),
+    /// The path has handlers on this listener, none for the method: 405.
+    MethodNotAllowed,
+    /// No handler of the path is served on this listener: 404, the answer
+    /// for a path that does not exist.
+    NotOnThisListener,
+}
+
+/// Pick the handler for a request among the ones registered for its path.
+pub(crate) fn match_route(
+    scopes: &[RouteScope],
+    method: &Method,
+    listener: Option<&str>,
+) -> RouteMatch {
+    let mut on_this_listener = false;
+    for (index, scope) in scopes.iter().enumerate() {
+        if !scope.serves_listener(listener) {
+            continue;
+        }
+        if scope.methods.contains(method) {
+            return RouteMatch::Handler(index);
+        }
+        on_this_listener = true;
+    }
+    if on_this_listener {
+        RouteMatch::MethodNotAllowed
+    } else {
+        RouteMatch::NotOnThisListener
+    }
+}
+
+/// The listener names routes ask for that no `servers[]` entry has, each
+/// with the path of the route that names it.
+pub(crate) fn unknown_route_listeners<'a>(
+    routes: impl IntoIterator<Item = (&'a str, &'a RouteScope)>,
+    cfg: &HttpConfig,
+) -> Vec<(String, String)> {
+    let mut unknown = Vec::new();
+    for (path, scope) in routes {
+        for name in scope.listeners.iter().flatten() {
+            let known = cfg
+                .servers
+                .iter()
+                .any(|server| server.listener_name() == name);
+            if !known {
+                unknown.push((path.to_string(), name.clone()));
+            }
+        }
+    }
+    unknown
 }
 
 fn build_method_router(
-    entries: Vec<(Vec<Method>, HandlerHandle)>,
+    entries: Vec<RouteEntry>,
     middlewares: Arc<Vec<HandlerHandle>>,
     script: ScriptHandle,
 ) -> MethodRouter {
@@ -309,35 +458,68 @@ fn build_method_router(
     // same path with different method sets without needing axum's typed
     // `.get(...).put(...)` wiring at build time.
     //
-    // Wrap entries in Arc — `HandlerHandle: Clone` calls `Py<T>::clone` under
-    // the hood, which panics when invoked from a tokio worker that hasn't
+    // Wrap the handlers in Arc: `HandlerHandle: Clone` calls `Py<T>::clone`
+    // under the hood, which panics when invoked from a tokio worker that hasn't
     // called `Python::attach`. Cloning the Arc is a plain refcount bump.
-    let entries = Arc::new(entries);
+    let (scopes, handlers): (Vec<RouteScope>, Vec<HandlerHandle>) = entries
+        .into_iter()
+        .map(|entry| (entry.scope, entry.handler))
+        .unzip();
+    let scopes = Arc::new(scopes);
+    let handlers = Arc::new(handlers);
     any(move |req: AxumRequest| {
-        let entries = Arc::clone(&entries);
+        let scopes = Arc::clone(&scopes);
+        let handlers = Arc::clone(&handlers);
         let middlewares = Arc::clone(&middlewares);
         let script = script.clone();
-        async move { dispatch(req, entries, middlewares, script).await }
+        async move { dispatch(req, scopes, handlers, middlewares, script).await }
     })
+}
+
+/// Decide which of a path's handlers serves `request`, from its method and
+/// the listener it arrived on.
+pub(crate) fn route_gate(scopes: &[RouteScope], request: &AxumRequest) -> RouteMatch {
+    let listener = request
+        .extensions()
+        .get::<ConnectionInfo>()
+        .map(|connection| connection.listener.name.as_str());
+    match_route(scopes, request.method(), listener)
+}
+
+impl RouteMatch {
+    /// The response to a request no handler serves.
+    pub(crate) fn refusal(&self) -> AxumResponse {
+        match self {
+            RouteMatch::MethodNotAllowed => {
+                error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+            }
+            // What axum answers for a path no route has: the route does not
+            // exist on this listener, and the answer does not say otherwise.
+            RouteMatch::NotOnThisListener | RouteMatch::Handler(_) => {
+                let mut response = AxumResponse::new(Body::empty());
+                *response.status_mut() = StatusCode::NOT_FOUND;
+                response
+            }
+        }
+    }
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────────
 
 async fn dispatch(
     req: AxumRequest,
-    entries: Arc<Vec<(Vec<Method>, HandlerHandle)>>,
+    scopes: Arc<Vec<RouteScope>>,
+    handlers: Arc<Vec<HandlerHandle>>,
     middlewares: Arc<Vec<HandlerHandle>>,
     script: ScriptHandle,
 ) -> AxumResponse {
-    let method = req.method().clone();
-    let handler_idx = match entries
-        .iter()
-        .position(|(methods, _)| methods.contains(&method))
-    {
-        Some(i) => i,
-        None => return error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+    let handler = match route_gate(&scopes, &req) {
+        RouteMatch::Handler(index) => match handlers.get(index) {
+            Some(handler) => handler,
+            None => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
+        },
+        refused => return refused.refusal(),
     };
-    let handler = &entries[handler_idx].1;
 
     let (parts, body) = req.into_parts();
     let body_bytes = match collect_body(body).await {
@@ -348,28 +530,7 @@ async fn dispatch(
         }
     };
 
-    let path_params = parts
-        .extensions
-        .get::<MatchedPath>()
-        .map(|m| extract_path_params(m.as_str(), parts.uri.path()))
-        .unwrap_or_default();
-    let query_params = parse_query(parts.uri.query().unwrap_or(""));
-    let headers = headers_to_map(&parts.headers);
-    let peer = parts
-        .extensions
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|c| c.0);
-    let client = client_addr(peer, &parts.headers);
-
-    let py_request = PyRequest::from_parts(
-        method.as_str().to_string(),
-        parts.uri.path().to_string(),
-        path_params,
-        query_params,
-        headers,
-        body_bytes.to_vec(),
-        client,
-    );
+    let py_request = request_from_parts(&parts, body_bytes.to_vec());
 
     // Build the request pyclass once; share it (refcount clone) across every
     // middleware plus the route handler.
@@ -407,6 +568,42 @@ async fn dispatch(
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "handler error")
         }
     }
+}
+
+/// The `Request` a handler receives, from the head of an HTTP request and its
+/// buffered body.
+pub(crate) fn request_from_parts(parts: &axum::http::request::Parts, body: Vec<u8>) -> PyRequest {
+    let path_params = parts
+        .extensions
+        .get::<MatchedPath>()
+        .map(|m| extract_path_params(m.as_str(), parts.uri.path()))
+        .unwrap_or_default();
+    let query_params = parse_query(parts.uri.query().unwrap_or(""));
+    let headers = headers_to_map(&parts.headers);
+    let peer = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
+    let client = client_addr(peer, &parts.headers);
+    // An HTTP/2 request carries the name in `:authority`, which hyper puts in
+    // the request target; HTTP/1.1 carries it in `Host`.
+    let host = parts
+        .uri
+        .authority()
+        .map(|authority| authority.as_str().to_string())
+        .or_else(|| headers.get("host").cloned());
+
+    PyRequest::from_parts(
+        parts.method.as_str().to_string(),
+        parts.uri.path().to_string(),
+        path_params,
+        query_params,
+        headers,
+        body,
+        client,
+        host,
+        parts.extensions.get::<ConnectionInfo>().cloned(),
+    )
 }
 
 enum MwOutcome {
@@ -517,12 +714,14 @@ fn listener_failures_are_fatal(route_count: usize, failures: usize) -> bool {
 /// a TCP readiness probe does not pass early.
 pub(crate) struct BoundListener {
     listen: String,
+    /// What routes and handlers call this listener.
+    name: String,
     socket: tokio::net::TcpSocket,
-    tls: Option<axum_server::tls_rustls::RustlsConfig>,
+    tls: Option<(axum_server::tls_rustls::RustlsConfig, Sha256)>,
 }
 
 /// Parse the address, load any TLS material, and bind the socket.
-fn bind_listener(server: &ServerConfig) -> Result<BoundListener, ListenerError> {
+pub(crate) fn bind_listener(server: &ServerConfig) -> Result<BoundListener, ListenerError> {
     let fail = |source| ListenerError {
         listen: server.listen.clone(),
         source,
@@ -549,6 +748,7 @@ fn bind_listener(server: &ServerConfig) -> Result<BoundListener, ListenerError> 
 
     Ok(BoundListener {
         listen: server.listen.clone(),
+        name: server.listener_name().to_string(),
         socket,
         tls,
     })
@@ -556,24 +756,35 @@ fn bind_listener(server: &ServerConfig) -> Result<BoundListener, ListenerError> 
 
 impl BoundListener {
     #[cfg(test)]
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+    pub(crate) fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.socket.local_addr()
     }
 
     /// Start listening and serve `router` until the server stops.
-    async fn serve(self, router: Router) -> std::io::Result<()> {
+    pub(crate) async fn serve(self, router: Router) -> std::io::Result<()> {
         let listener = self.socket.listen(LISTEN_BACKLOG)?.into_std()?;
         let addr = listener.local_addr()?;
         let app = router.into_make_service_with_connect_info::<SocketAddr>();
 
-        if let Some(config) = self.tls {
-            tracing::info!(target: "siphon_http", listen = %addr, tls = true, "serving HTTPS listener");
-            axum_server::from_tcp_rustls(listener, config)?
-                .serve(app)
-                .await?;
+        // Each listener has an acceptor of its own, which tells every request
+        // which listener it came through and, over TLS, in which session.
+        let identity = Arc::new(ListenerIdentity {
+            name: self.name,
+            tls: self.tls.is_some(),
+        });
+        let server = axum_server::from_tcp(listener)?;
+        if let Some((config, sha256)) = self.tls {
+            tracing::info!(target: "siphon_http", listen = %addr, name = %identity.name, tls = true, "serving HTTPS listener");
+            let acceptor = TlsAcceptor {
+                listener: identity,
+                inner: axum_server::tls_rustls::RustlsAcceptor::new(config),
+                sha256,
+            };
+            server.acceptor(acceptor).serve(app).await?;
         } else {
-            tracing::info!(target: "siphon_http", listen = %addr, tls = false, "serving HTTP listener");
-            axum_server::from_tcp(listener)?.serve(app).await?;
+            tracing::info!(target: "siphon_http", listen = %addr, name = %identity.name, tls = false, "serving HTTP listener");
+            let acceptor = PlainAcceptor { listener: identity };
+            server.acceptor(acceptor).serve(app).await?;
         }
         Ok(())
     }
@@ -585,11 +796,15 @@ impl BoundListener {
 /// when `client_ca` is set (mutual TLS), and advertises ALPN `h2, http/1.1` so
 /// HTTP/2 negotiates over TLS. Pins the ring crypto provider explicitly to
 /// avoid ambiguity when more than one provider is linked.
-fn build_rustls_config(tls: &TlsConfig) -> std::io::Result<axum_server::tls_rustls::RustlsConfig> {
+fn build_rustls_config(
+    tls: &TlsConfig,
+) -> std::io::Result<(axum_server::tls_rustls::RustlsConfig, Sha256)> {
     let certs = load_certs(&tls.cert_path)?;
     let key = load_key(&tls.key_path)?;
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    // For the fingerprint of a client certificate (`req.tls`).
+    let sha256 = Sha256::from_provider(&provider)?;
     let builder = RustlsServerConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(to_io)?;
@@ -611,8 +826,9 @@ fn build_rustls_config(tls: &TlsConfig) -> std::io::Result<axum_server::tls_rust
     let mut config = builder.with_single_cert(certs, key).map_err(to_io)?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
-        Arc::new(config),
+    Ok((
+        axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(config)),
+        sha256,
     ))
 }
 

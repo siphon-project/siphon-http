@@ -36,14 +36,19 @@
 
 pub mod client;
 pub mod config;
+pub mod connection;
+#[cfg(test)]
+mod connection_tests;
 pub mod install;
 pub mod parse;
 pub mod request;
 pub mod response;
 pub mod runtime;
+mod x509;
 
 pub use client::Client;
 pub use config::{ClientConfig, HttpConfig, ServerConfig, TlsConfig};
+pub use connection::{Listener, PeerCertificate, TlsInfo};
 pub use install::{namespace, task};
 pub use request::Request;
 pub use response::Response;

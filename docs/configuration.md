@@ -51,6 +51,7 @@ once.
 | Key | Type | Description |
 |---|---|---|
 | `listen` | string | Bind address as an IP literal and port (e.g. `0.0.0.0:8443`, `127.0.0.1:9090`, `[::]:8443`). Hostnames are not resolved. |
+| `name` | string | Optional. A name for the listener: what a route names to be served on it alone, and what a handler reads as `req.listener.name`. Without one the listener is known by its `listen` value. Two listeners of one name are a load error. See [Routes on one listener](#routes-on-one-listener). |
 | `tls` | map | Optional. Present → the listener terminates TLS. Absent → plain HTTP. See [TLS](#tls-termination). |
 | `max_body_bytes` | int | Optional. Cap on the buffered request body. A larger body is rejected with `413 Payload Too Large`. |
 | `request_timeout_ms` | int | Optional. Per-request time budget in milliseconds. |
@@ -95,6 +96,40 @@ servers:
       key_path:  "/etc/siphon/tls/server.key"
       client_ca: "/etc/siphon/tls/client-ca.crt"   # require + verify client certs
 ```
+
+A handler reads the certificate the client presented from `req.tls`: its
+subject, its subject alternative names and its SHA-256 fingerprint. That is
+what to tie a peer's identity to, not its source address. With `client_ca`
+set the handshake of a client without a certificate of that CA fails, so no
+request of such a client reaches a handler.
+
+### Routes on one listener
+
+By default every route is served on every listener. A route that belongs on
+one of them, such as an internal interface that must not answer on the public
+port, names its listeners:
+
+```yaml
+servers:
+  - listen: "0.0.0.0:8080"
+    name: public
+  - listen: "192.0.2.10:8443"
+    name: internal
+    tls:
+      cert_path: "/etc/siphon/tls/server.crt"
+      key_path:  "/etc/siphon/tls/server.key"
+      client_ca: "/etc/siphon/tls/client-ca.crt"
+```
+
+```python
+@http.route("/internal/keys", methods=["POST"], listeners=["internal"])
+async def keys(req):
+    ...
+```
+
+On `public` the path answers `404`, as a path no route has. A route that
+names a listener the file does not have stops siphon at startup. Middleware
+runs on every listener; it can branch on `req.listener.name`.
 
 ## `clients`
 

@@ -32,7 +32,7 @@ def _registry():
     return _r
 
 
-def route(path, methods=None):
+def route(path, methods=None, listeners=None):
     """
     Register a handler for an HTTP route.
 
@@ -41,6 +41,12 @@ def route(path, methods=None):
 
     `methods` is a list of HTTP method strings; default is `["GET"]`.
 
+    `listeners` is a list of listener names (`servers[].name` in the addon
+    config, or the `listen` value of an entry without a name). The route is
+    then served on those listeners only and answers 404 on every other one.
+    The default, `None`, serves the route on every listener. A name no
+    listener has stops siphon at startup.
+
     The handler receives a single `Request` argument and returns a `Response`.
     Returning anything else (including None) is a script error and produces a
     500.
@@ -48,6 +54,11 @@ def route(path, methods=None):
     if methods is None:
         methods = ["GET"]
     methods = [m.upper() for m in methods]
+    if isinstance(listeners, str):
+        # A bare string would otherwise be read as a list of its characters.
+        listeners = [listeners]
+    elif listeners is not None:
+        listeners = list(listeners)
 
     def decorator(fn):
         _registry().register(
@@ -55,7 +66,7 @@ def route(path, methods=None):
             None,
             fn,
             asyncio.iscoroutinefunction(fn),
-            {"path": path, "methods": methods},
+            {"path": path, "methods": methods, "listeners": listeners},
         )
         return fn
 
@@ -110,6 +121,18 @@ class Request:
         query_params: dict[str, str]
         headers:      lowercase-keyed dict
         client:       remote socket address as "ip:port"
+        host:         the host the client addressed: the `:authority` of an
+                      HTTP/2 request, or else the Host header; None if neither
+        listener:     the listener the request arrived on, with `name`,
+                      `address` ("ip:port" of the local end), `port` and `tls`
+        tls:          the TLS session of the connection, or None on a
+                      cleartext listener, with `version` ("TLSv1.3"),
+                      `cipher_suite` (IANA name), `cipher_suite_id` (int),
+                      `cipher_suite_bytes` (two octets), `server_name` (SNI),
+                      `alpn`, `peer_verified`, `peer_certificate` and
+                      `peer_certificates`; a certificate has `subject`
+                      (RFC 4514), `subject_alt_names` ((kind, value) tuples),
+                      `fingerprint_sha256` (hex) and `der`
 
     Methods:
         req.body() -> bytes              (body is buffered)
@@ -122,6 +145,9 @@ class Request:
     query_params: dict
     headers: dict
     client: str
+    host: object
+    listener: object
+    tls: object
 
     def body(self) -> bytes:
         raise NotImplementedError("overridden by siphon-http at install time")

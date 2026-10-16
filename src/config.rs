@@ -158,7 +158,8 @@ pub enum ConfigError {
     #[error("parse {path}: {source}")]
     Parse {
         path: String,
-        source: serde_yaml::Error,
+        // Boxed: the parser's error carries a source snippet and is large.
+        source: Box<serde_saphyr::Error>,
     },
     #[error(
         "{path}: servers[{index}].listen {listen:?} is not an IP:port socket address: {source}"
@@ -199,10 +200,15 @@ impl HttpConfig {
     /// than a listener that never comes up.
     fn parse(raw: &str, path: &str) -> Result<Self, ConfigError> {
         let expanded = siphon::config::expand_env_vars(raw);
+        // Only `true` / `false` (any case) are booleans, so a YAML 1.1 `yes` /
+        // `on` stays the error it always was rather than turning a switch on.
+        let options = serde_saphyr::options! { strict_booleans: true };
         let config: Self =
-            serde_yaml::from_str(&expanded).map_err(|source| ConfigError::Parse {
-                path: path.to_string(),
-                source,
+            serde_saphyr::from_str_with_options(&expanded, options).map_err(|source| {
+                ConfigError::Parse {
+                    path: path.to_string(),
+                    source: Box::new(source),
+                }
             })?;
         for (index, server) in config.servers.iter().enumerate() {
             server.socket_addr().map_err(|source| ConfigError::Listen {
@@ -339,6 +345,36 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, ConfigError::Listen { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn only_true_and_false_spell_a_boolean() {
+        // YAML 1.1 spellings such as `yes` / `on` are not booleans here, as
+        // they never were; `True` / `TRUE` are.
+        for spelling in ["yes", "on", "y", "no", "off"] {
+            let yaml = format!("clients:\n  a:\n    http2_prior_knowledge: {spelling}\n");
+            let error = HttpConfig::from_yaml(&yaml).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::Parse { .. }),
+                "{spelling}: {error:?}"
+            );
+        }
+        for (spelling, expected) in [("true", true), ("True", true), ("FALSE", false)] {
+            let yaml = format!("clients:\n  a:\n    http2_prior_knowledge: {spelling}\n");
+            let config = HttpConfig::from_yaml(&yaml).unwrap();
+            assert_eq!(
+                config.clients["a"].http2_prior_knowledge, expected,
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_duplicate_key_is_a_parse_error_naming_its_line() {
+        let error =
+            HttpConfig::from_yaml("clients:\n  api: {}\n  api:\n    pool_size: 3\n").unwrap_err();
+        assert!(matches!(error, ConfigError::Parse { .. }), "{error:?}");
+        assert!(error.to_string().contains("line 3"), "{error}");
     }
 
     #[test]

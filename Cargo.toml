@@ -55,7 +55,7 @@ tokio-rustls = "0.26"
 async-trait = "0.1"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
 thiserror = "2"
 
 [dev-dependencies]

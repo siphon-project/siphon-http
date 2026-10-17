@@ -22,10 +22,6 @@ ignore = [
     # paste — unmaintained transitive (no vuln); pulled via the pyo3 stack.
     # Remove once the parent crate drops it.
     "RUSTSEC-2024-0436",
-    # unsafe-libyaml — unmaintained; siphon-http no longer uses it, it comes in
-    # only through siphon-sip (serde_yaml_ng). Remove once the siphon-sip pin
-    # moves to a release without it (`cargo tree -i unsafe-libyaml` is empty).
-    "RUSTSEC-2024-0449",
 ]
 
 [bans]

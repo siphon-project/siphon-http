@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0] — 2026-10-17
+
 ### Changed
 
 - **`http.yaml` is parsed with `serde-saphyr`** instead of `serde_yaml`, which

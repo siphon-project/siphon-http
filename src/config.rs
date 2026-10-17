@@ -155,9 +155,13 @@ pub enum ConfigError {
         path: String,
         source: std::io::Error,
     },
-    #[error("parse {path}: {source}")]
+    #[error("parse {path}: {}{source}", key_prefix(key))]
     Parse {
         path: String,
+        /// Where in the document the error is, e.g. `servers[1].tls`
+        /// (`serde_path_to_error` notation). `None` when the error is in the
+        /// YAML syntax or at the top level rather than under a key.
+        key: Option<String>,
         // Boxed: the parser's error carries a source snippet and is large.
         source: Box<serde_saphyr::Error>,
     },
@@ -176,6 +180,12 @@ pub enum ConfigError {
         index: usize,
         name: String,
     },
+}
+
+fn key_prefix(key: &Option<String>) -> String {
+    key.as_deref()
+        .map(|key| format!("{key}: "))
+        .unwrap_or_default()
 }
 
 impl HttpConfig {
@@ -203,12 +213,21 @@ impl HttpConfig {
         // Only `true` / `false` (any case) are booleans, so a YAML 1.1 `yes` /
         // `on` stays the error it always was rather than turning a switch on.
         let options = serde_saphyr::options! { strict_booleans: true };
+        // serde_path_to_error tracks the key being deserialized, so the error
+        // names it next to the line and column the parser reports.
+        let mut key = None;
         let config: Self =
-            serde_saphyr::from_str_with_options(&expanded, options).map_err(|source| {
-                ConfigError::Parse {
-                    path: path.to_string(),
-                    source: Box::new(source),
-                }
+            serde_saphyr::with_deserializer_from_str_with_options(&expanded, options, |de| {
+                serde_path_to_error::deserialize(de).map_err(|error| {
+                    let at = error.path().to_string();
+                    key = (at != ".").then_some(at);
+                    error.into_inner()
+                })
+            })
+            .map_err(|source| ConfigError::Parse {
+                path: path.to_string(),
+                key,
+                source: Box::new(source),
             })?;
         for (index, server) in config.servers.iter().enumerate() {
             server.socket_addr().map_err(|source| ConfigError::Listen {
@@ -367,6 +386,23 @@ mod tests {
                 "{spelling}"
             );
         }
+    }
+
+    #[test]
+    fn a_parse_error_names_the_key_path_and_the_line() {
+        let error = HttpConfig::from_yaml("clients:\n  api:\n    pool_size: lots\n").unwrap_err();
+        assert!(matches!(error, ConfigError::Parse { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains("clients.api.pool_size"), "{message}");
+        assert!(message.contains("line 3"), "{message}");
+
+        let error = HttpConfig::from_yaml(
+            "servers:\n  - listen: \"127.0.0.1:8080\"\n  - listen: \"127.0.0.1:8081\"\n    tls:\n      key_path: /k\n",
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("servers[1].tls"), "{message}");
+        assert!(message.contains("cert_path"), "{message}");
     }
 
     #[test]

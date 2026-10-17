@@ -16,8 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   on input that did not load, or loaded oddly, before: a duplicate key is now a
   parse error (it used to keep the last value), `<<` merge keys are applied
   (they used to be ignored), `1_000` and quoted numbers / booleans are read as
-  their value, and a `~` (null) section takes its defaults. Parse errors now
-  quote the offending lines. `ConfigError::Parse::source` is a
+  their value, and a `~` (null) section takes its defaults. Parse errors name
+  the key path (`servers[1].tls`) and line, and quote the offending lines.
+  `ConfigError::Parse` gains `key: Option<String>` and its `source` is a
   `Box<serde_saphyr::Error>`.
 
 ## [1.2.0] — 2026-10-15

@@ -112,9 +112,16 @@ pub struct ClientConfig {
     #[serde(default = "default_client_timeout")]
     pub timeout_ms: u64,
 
-    /// CA bundle for verifying server certs. Empty = system roots.
+    /// CA bundle (PEM, every certificate of the file) for verifying server
+    /// certs, trusted beside the built-in roots. Empty = built-in roots only.
     #[serde(default)]
     pub verify: Option<String>,
+
+    /// Trust the `verify` bundle only, not the built-in roots: what a
+    /// client in an operator PKI wants, where a public CA must not vouch for
+    /// a peer. Needs `verify`.
+    #[serde(default)]
+    pub verify_only: bool,
 
     /// Client cert + key for mutual TLS (optional).
     #[serde(default)]

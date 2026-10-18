@@ -7,11 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `clients.<name>.verify_only` and `http.Client(verify_only=True)`: trust the
+  `verify` bundle only, not the built-in roots.
+
 ### Fixed
 
 - `http.Client` responses keep every value of a repeated header, joined with
   ", " as request headers are (RFC 9110 clause 5.3); before, only the last
   survived, so a relay lost the `Via` entries of the hops before it.
+- `verify` is read as a bundle. Before, only its first certificate was
+  trusted, so a bundle with an intermediate, or two roots during a rollover,
+  failed for every server of the second.
 
 ## [2.0.0] — 2026-10-17
 

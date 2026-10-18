@@ -217,7 +217,8 @@ Constructor keyword arguments:
 |---|---|
 | `name` | Positional. Look up `clients.<name>` from config. |
 | `base_url` | Base URL; relative request paths are joined onto it. |
-| `verify` | Path to a custom CA bundle to verify the server certificate. |
+| `verify` | Path to a CA bundle (every certificate in it) to verify the server certificate, beside the built-in roots. |
+| `verify_only` | Trust `verify` only, not the built-in roots. |
 | `cert` | Client-cert identity for mTLS — a combined PEM or a `(cert, key)` pair. |
 | `timeout_ms` | Per-request timeout in milliseconds. |
 | `http2_prior_knowledge` | Start cleartext connections in h2c. |

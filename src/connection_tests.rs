@@ -656,3 +656,36 @@ async fn a_restricted_route_is_not_reachable_through_another_listener() {
     assert_eq!(post(internal).await, 405);
     assert_eq!(post(public).await, 404);
 }
+
+/// `verify` is read as a bundle: a server whose CA is the second certificate
+/// of the file is trusted. With `verify_only` nothing outside the bundle is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_trusts_every_certificate_of_its_bundle_and_with_verify_only_nothing_else() {
+    let address = serve(&tls_yaml("zt", false)).await;
+    let directory = std::env::temp_dir().join(format!("siphon-http-trust-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let read = |name: &str| std::fs::read_to_string(format!("{FIXTURES}/{name}")).unwrap();
+    let both = directory.join("both.pem");
+    std::fs::write(&both, read("untrusted-client.pem") + &read("ca.pem")).unwrap();
+    let other = directory.join("other.pem");
+    std::fs::write(&other, read("untrusted-client.pem")).unwrap();
+    let url = format!("https://localhost:{}/", address.port());
+    let send = |path: &std::path::Path, only: bool| {
+        let client = crate::client::trusting(reqwest::Client::builder(), path.to_str(), only)
+            .unwrap()
+            .build()
+            .unwrap();
+        let url = url.clone();
+        async move { client.get(url).send().await }
+    };
+    assert!(
+        send(&both, true).await.is_ok(),
+        "the CA second in the bundle is trusted"
+    );
+    assert!(
+        send(&other, true).await.is_err(),
+        "a bundle without the CA trusts nothing else"
+    );
+    assert!(crate::client::trusting(reqwest::Client::builder(), None, true).is_err());
+    std::fs::remove_dir_all(&directory).unwrap();
+}

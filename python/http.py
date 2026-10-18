@@ -199,7 +199,7 @@ class Client:
     """
 
     def __init__(self, name=None, *, base_url=None, verify=None, cert=None, timeout_ms=None,
-                 http2_prior_knowledge=False):
+                 http2_prior_knowledge=False, verify_only=False):
         raise NotImplementedError("provided by Rust side at runtime")
 
     async def get(self, path, *, headers=None) -> "Response":

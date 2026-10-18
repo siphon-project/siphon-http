@@ -235,15 +235,9 @@ impl Client {
                 .map_err(|e| PyRuntimeError::new_err(format!("request failed: {e}")))?;
 
             let status = resp.status().as_u16();
-            let headers: HashMap<String, String> = resp
-                .headers()
-                .iter()
-                .filter_map(|(k, v)| {
-                    v.to_str()
-                        .ok()
-                        .map(|s| (k.as_str().to_string(), s.to_string()))
-                })
-                .collect();
+            // A repeated header (several Via of the hops a response came
+            // through) is joined as on the server side, not cut to its last.
+            let headers = crate::runtime::headers_to_map(resp.headers());
             let body_bytes = resp
                 .bytes()
                 .await

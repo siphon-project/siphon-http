@@ -152,7 +152,8 @@ clients:
 |---|---|---|
 | `base_url` | string | Base URL; relative paths passed to the client are joined onto it. |
 | `timeout_ms` | int | Optional. Per-request timeout in milliseconds. |
-| `verify` | string | Optional. Path to a custom CA bundle (PEM) used to verify the server certificate. |
+| `verify` | string | Optional. Path to a CA bundle (PEM, every certificate in it) trusted to verify the server certificate, beside the built-in roots. |
+| `verify_only` | bool | Optional. Trust the `verify` bundle only, not the built-in roots (an operator PKI, where a public CA must not vouch for a peer). Needs `verify`. |
 | `cert` | string / pair | Optional. Client-certificate identity for mutual TLS — a combined PEM, or a `(cert, key)` pair. |
 | `pool_size` | int | Optional. Max pooled connections. |
 | `http2_prior_knowledge` | bool | Optional. Start cleartext connections directly in HTTP/2 (h2c) instead of HTTP/1.1. TLS uses ALPN regardless. |

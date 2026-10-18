@@ -22,6 +22,35 @@ use reqwest::Method;
 use crate::config::ClientConfig;
 use crate::Response as PyResponse;
 
+/// The server certificates a client trusts: every certificate of the
+/// `verify` bundle, beside the built-in roots or, with `verify_only`,
+/// instead of them.
+pub(crate) fn trusting(
+    mut builder: reqwest::ClientBuilder,
+    verify: Option<&str>,
+    verify_only: bool,
+) -> Result<reqwest::ClientBuilder, String> {
+    match verify {
+        Some(path) => {
+            let pem = std::fs::read(path).map_err(|e| format!("read verify CA: {e}"))?;
+            let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+                .map_err(|e| format!("parse verify CA: {e}"))?;
+            if certificates.is_empty() {
+                return Err(format!("verify CA: no certificate in {path}"));
+            }
+            for certificate in certificates {
+                builder = builder.add_root_certificate(certificate);
+            }
+        }
+        None if verify_only => return Err("verify_only needs verify".into()),
+        None => {}
+    }
+    if verify_only {
+        builder = builder.tls_built_in_root_certs(false);
+    }
+    Ok(builder)
+}
+
 #[pyclass(module = "siphon", name = "Client")]
 pub struct Client {
     inner: Arc<reqwest::Client>,
@@ -38,6 +67,7 @@ impl Client {
         cert=None,
         timeout_ms=None,
         http2_prior_knowledge=false,
+        verify_only=false,
     ))]
     fn new(
         name: Option<&str>,
@@ -46,6 +76,7 @@ impl Client {
         cert: Option<Bound<'_, PyAny>>,
         timeout_ms: Option<u64>,
         http2_prior_knowledge: bool,
+        verify_only: bool,
     ) -> PyResult<Self> {
         // Named-client lookup resolves against the install-time HttpConfig
         // stashed by the runtime (see `crate::runtime::set_named_clients`).
@@ -56,13 +87,7 @@ impl Client {
         let mut builder =
             reqwest::Client::builder().timeout(Duration::from_millis(timeout_ms.unwrap_or(5_000)));
 
-        if let Some(ca_path) = verify {
-            let ca_bytes = std::fs::read(ca_path)
-                .map_err(|e| PyRuntimeError::new_err(format!("read verify CA: {e}")))?;
-            let cert = reqwest::Certificate::from_pem(&ca_bytes)
-                .map_err(|e| PyRuntimeError::new_err(format!("parse verify CA: {e}")))?;
-            builder = builder.add_root_certificate(cert);
-        }
+        builder = trusting(builder, verify, verify_only).map_err(PyRuntimeError::new_err)?;
 
         if let Some(cert) = cert {
             // Tuple `(cert_path, key_path)` or single combined-PEM path.
@@ -178,13 +203,8 @@ impl Client {
             .timeout(Duration::from_millis(cfg.timeout_ms))
             .pool_max_idle_per_host(cfg.pool_size);
 
-        if let Some(ca_path) = cfg.verify.as_deref() {
-            let ca_bytes = std::fs::read(ca_path)
-                .map_err(|e| PyRuntimeError::new_err(format!("read verify CA: {e}")))?;
-            let cert = reqwest::Certificate::from_pem(&ca_bytes)
-                .map_err(|e| PyRuntimeError::new_err(format!("parse verify CA: {e}")))?;
-            builder = builder.add_root_certificate(cert);
-        }
+        builder = trusting(builder, cfg.verify.as_deref(), cfg.verify_only)
+            .map_err(PyRuntimeError::new_err)?;
 
         if let (Some(cert_path), Some(key_path)) = (cfg.cert.as_deref(), cfg.key.as_deref()) {
             let identity = identity_from_paths(cert_path, key_path)?;

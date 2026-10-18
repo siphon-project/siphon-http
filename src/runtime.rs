@@ -640,7 +640,9 @@ async fn collect_body(body: Body) -> Result<Bytes, axum::Error> {
     Ok(collected.to_bytes())
 }
 
-fn headers_to_map(headers: &HeaderMap) -> HashMap<String, String> {
+/// Lower-cased names; a repeated header's values joined with ", " (RFC
+/// 9110 clause 5.3), for requests and for the responses of `http.Client`.
+pub(crate) fn headers_to_map(headers: &HeaderMap) -> HashMap<String, String> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     for (name, value) in headers {
         let name = name.as_str().to_ascii_lowercase();
@@ -872,6 +874,17 @@ fn to_io<E: std::fmt::Display>(e: E) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn repeated_headers_are_joined_in_order() {
+        let mut headers = super::HeaderMap::new();
+        headers.append("via", "2.0 SEPP-a.example".parse().unwrap());
+        headers.append("Via", "2.0 SCP-b.example".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let map = super::headers_to_map(&headers);
+        assert_eq!(map["via"], "2.0 SEPP-a.example, 2.0 SCP-b.example");
+        assert_eq!(map["content-type"], "application/json");
+    }
+
     use super::{
         bind_listener, listener_failures_are_fatal, load_certs, load_key, pem_to_io,
         RustlsServerConfig,

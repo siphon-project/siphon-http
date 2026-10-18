@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `http.Client` responses keep every value of a repeated header, joined with
+  ", " as request headers are (RFC 9110 clause 5.3); before, only the last
+  survived, so a relay lost the `Via` entries of the hops before it.
+
 ## [2.0.0] — 2026-10-17
 
 ### Changed

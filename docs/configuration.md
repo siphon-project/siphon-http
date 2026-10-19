@@ -160,6 +160,18 @@ clients:
 | `http2_prior_knowledge` | bool | Optional. Start cleartext connections directly in HTTP/2 (h2c) instead of HTTP/1.1. TLS uses ALPN regardless. |
 | `follow_redirects` | bool | Optional, default `true`: a 3xx is followed to its `Location` (up to 10 hops) inside the request. `false` returns the 3xx to the script as received, `Location` and the other headers included, to relay or follow itself. |
 
+Rust code that links siphon-http reaches the same pool with
+`HttpClient::named(&config, "api")`, before or without the server task, and
+sends with `request(method, target, headers, body)`:
+
+```rust
+let client = siphon_http::HttpClient::named(&config, "api")?;
+let reply = client.request(http::Method::GET, "/v1/things", &[], None).await?;
+```
+
+A name is one pool per process, whoever asks first. A second configuration
+that gives the name other settings gets `ClientError::Conflict`.
+
 Handlers can also build **inline** clients that don't need a config entry —
 `http.Client(base_url=…, verify=…, cert=…)`. Named clients are preferable for
 anything hot, because they share a pool. See the

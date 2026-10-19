@@ -11,7 +11,6 @@
 //! All methods are coroutines returning a [`crate::Response`].
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
@@ -20,6 +19,7 @@ use pyo3::types::{PyBytes, PyString};
 use reqwest::Method;
 
 use crate::config::ClientConfig;
+use crate::outbound::{ClientError, HttpClient};
 use crate::Response as PyResponse;
 
 /// The server certificates a client trusts: every certificate of the
@@ -60,31 +60,9 @@ fn redirecting(builder: reqwest::ClientBuilder, follow: bool) -> reqwest::Client
     }
 }
 
-/// The builder of a named client, as `clients.<name>` configures it.
-pub(crate) fn pooled(cfg: &ClientConfig) -> PyResult<reqwest::ClientBuilder> {
-    let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_millis(cfg.timeout_ms))
-        .pool_max_idle_per_host(cfg.pool_size);
-
-    builder = trusting(builder, cfg.verify.as_deref(), cfg.verify_only)
-        .map_err(PyRuntimeError::new_err)?;
-
-    if let (Some(cert_path), Some(key_path)) = (cfg.cert.as_deref(), cfg.key.as_deref()) {
-        let identity = identity_from_paths(cert_path, key_path)?;
-        builder = builder.identity(identity);
-    }
-
-    if cfg.http2_prior_knowledge {
-        builder = builder.http2_prior_knowledge();
-    }
-
-    Ok(redirecting(builder, cfg.follow_redirects))
-}
-
 #[pyclass(module = "siphon", name = "Client")]
 pub struct Client {
-    inner: Arc<reqwest::Client>,
-    base_url: Option<String>,
+    outbound: HttpClient,
 }
 
 #[pymethods]
@@ -136,8 +114,7 @@ impl Client {
             .map_err(|e| PyRuntimeError::new_err(format!("build reqwest client: {e}")))?;
 
         Ok(Self {
-            inner: Arc::new(inner),
-            base_url: base_url.map(|s| s.to_string()),
+            outbound: HttpClient::from_parts(inner, base_url),
         })
     }
 
@@ -223,24 +200,47 @@ impl Client {
 }
 
 impl Client {
-    /// Build a client from a named entry in the install-time config.
-    fn from_named(name: &str) -> PyResult<Self> {
-        let cfg: ClientConfig = crate::runtime::named_client(name).ok_or_else(|| {
-            PyRuntimeError::new_err(format!(
-                "no client named {name:?} in the http addon config (clients.{name})"
-            ))
-        })?;
+    /// The shared pool of a named entry in the install-time config.
+    pub(crate) fn from_named(name: &str) -> PyResult<Self> {
+        let cfg = crate::runtime::named_client(name).ok_or_else(|| ClientError::UnknownClient {
+            name: name.to_string(),
+        });
+        let outbound = cfg
+            .and_then(|cfg| HttpClient::pooled(name, &cfg))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { outbound })
+    }
 
-        let builder = pooled(&cfg)?;
+    #[cfg(test)]
+    pub(crate) fn outbound(&self) -> &HttpClient {
+        &self.outbound
+    }
 
-        let inner = builder
+    /// Build the pool of a `clients.<name>` entry. Called once per name, by
+    /// [`HttpClient::named`] and `http.Client("<name>")` alike.
+    pub(crate) fn pool(cfg: &ClientConfig) -> Result<reqwest::Client, ClientError> {
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_millis(cfg.timeout_ms))
+            .pool_max_idle_per_host(cfg.pool_size);
+
+        builder = trusting(builder, cfg.verify.as_deref(), cfg.verify_only)
+            .map_err(|reason| ClientError::Configuration { reason })?;
+
+        if let (Some(cert_path), Some(key_path)) = (cfg.cert.as_deref(), cfg.key.as_deref()) {
+            let identity = identity_from_paths(cert_path, key_path)
+                .map_err(|reason| ClientError::Configuration { reason })?;
+            builder = builder.identity(identity);
+        }
+
+        if cfg.http2_prior_knowledge {
+            builder = builder.http2_prior_knowledge();
+        }
+
+        redirecting(builder, cfg.follow_redirects)
             .build()
-            .map_err(|e| PyRuntimeError::new_err(format!("build reqwest client: {e}")))?;
-
-        Ok(Self {
-            inner: Arc::new(inner),
-            base_url: cfg.base_url,
-        })
+            .map_err(|e| ClientError::Configuration {
+                reason: format!("build reqwest client: {e}"),
+            })
     }
 
     fn send<'py>(
@@ -251,41 +251,19 @@ impl Client {
         body: Option<Vec<u8>>,
         headers: Option<HashMap<String, String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let url = match &self.base_url {
-            Some(base) => format!("{}{}", base.trim_end_matches('/'), path),
-            None => path.to_string(),
-        };
-        let inner = Arc::clone(&self.inner);
+        let outbound = self.outbound.clone();
+        let path = path.to_string();
+        let headers: Vec<(String, String)> = headers.unwrap_or_default().into_iter().collect();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut req = inner.request(method, &url);
-            if let Some(h) = headers {
-                for (k, v) in h {
-                    req = req.header(&k, &v);
-                }
-            }
-            if let Some(b) = body {
-                req = req.body(b);
-            }
-            let resp = req
-                .send()
+            let reply = outbound
+                .request(method, path.as_str(), &headers, body)
                 .await
-                .map_err(|e| PyRuntimeError::new_err(format!("request failed: {e}")))?;
-
-            let status = resp.status().as_u16();
-            // A repeated header (several Via of the hops a response came
-            // through) is joined as on the server side, not cut to its last.
-            let headers = crate::runtime::headers_to_map(resp.headers());
-            let body_bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("read body: {e}")))?
-                .to_vec();
-
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let py_resp = PyResponse {
-                status,
-                headers,
-                body_bytes,
+                status: reply.status,
+                headers: reply.headers.into_iter().collect(),
+                body_bytes: reply.body,
             };
             Python::attach(|py| Ok(Py::new(py, py_resp)?.into_any()))
         })
@@ -307,7 +285,7 @@ fn build_identity(cert: Bound<'_, PyAny>) -> PyResult<reqwest::Identity> {
     // path. PEM with cert-then-key is reqwest's expected format for
     // `Identity::from_pem`.
     if let Ok((c, k)) = cert.extract::<(String, String)>() {
-        identity_from_paths(&c, &k)
+        identity_from_paths(&c, &k).map_err(PyRuntimeError::new_err)
     } else if let Ok(path) = cert.extract::<String>() {
         let pem = std::fs::read(&path)
             .map_err(|e| PyRuntimeError::new_err(format!("read cert {path}: {e}")))?;
@@ -320,12 +298,9 @@ fn build_identity(cert: Bound<'_, PyAny>) -> PyResult<reqwest::Identity> {
     }
 }
 
-fn identity_from_paths(cert_path: &str, key_path: &str) -> PyResult<reqwest::Identity> {
-    let mut buf = std::fs::read(cert_path)
-        .map_err(|e| PyRuntimeError::new_err(format!("read cert {cert_path}: {e}")))?;
-    let mut key = std::fs::read(key_path)
-        .map_err(|e| PyRuntimeError::new_err(format!("read key {key_path}: {e}")))?;
+fn identity_from_paths(cert_path: &str, key_path: &str) -> Result<reqwest::Identity, String> {
+    let mut buf = std::fs::read(cert_path).map_err(|e| format!("read cert {cert_path}: {e}"))?;
+    let mut key = std::fs::read(key_path).map_err(|e| format!("read key {key_path}: {e}"))?;
     buf.append(&mut key);
-    reqwest::Identity::from_pem(&buf)
-        .map_err(|e| PyRuntimeError::new_err(format!("parse identity: {e}")))
+    reqwest::Identity::from_pem(&buf).map_err(|e| format!("parse identity: {e}"))
 }

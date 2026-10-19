@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `HttpClient::named(&HttpConfig, name)`: the pool of `clients.<name>` for
+  Rust code that links this crate, with `request(method, target, headers,
+  body)` returning a `Reply` (status, joined header fields, body) or a typed
+  `ClientError`. It needs neither the server task nor a Python interpreter,
+  so it works before `task` runs.
 - `clients.<name>.verify_only` and `http.Client(verify_only=True)`: trust the
   `verify` bundle only, not the built-in roots.
 - `clients.<name>.follow_redirects` and `http.Client(follow_redirects=False)`:
@@ -16,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   following it inside the request. A proxy can then relay the redirect, or
   follow it itself without the client dropping `Authorization` on a
   cross-origin hop. Default on, as before.
+
+### Changed
+
+- `http.Client("<name>")` is the one pool of `clients.<name>`, shared by
+  every `http.Client` of that name and by `HttpClient::named`. Before, each
+  instance built a pool of its own. Its error messages no longer carry the
+  request URL.
 
 ### Fixed
 

@@ -102,7 +102,7 @@ pub struct TlsConfig {
     pub client_ca: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
     /// Optional base URL prepended to relative request paths.
     #[serde(default)]

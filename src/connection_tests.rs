@@ -715,10 +715,7 @@ async fn a_named_client_follows_a_redirect_unless_told_not_to() {
 
     let send = |yaml: String| async move {
         let config = HttpConfig::from_yaml(&yaml).unwrap();
-        let client = crate::client::pooled(&config.clients["p"])
-            .unwrap()
-            .build()
-            .unwrap();
+        let client = crate::client::Client::pool(&config.clients["p"]).unwrap();
         for _ in 0..200 {
             if let Ok(response) = client.get(format!("http://{address}/old")).send().await {
                 return response;

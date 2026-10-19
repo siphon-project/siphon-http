@@ -75,6 +75,7 @@ extensions:
 | Custom CA / server-cert verification | ✅ `verify=` / `clients.<n>.verify` |
 | Mutual TLS identity | ✅ `cert=(cert, key)` or combined PEM |
 | Connection pooling | ✅ pooled `reqwest::Client` |
+| From Rust | ✅ `HttpClient::named(&config, "api")`, the same pool, no Python needed |
 | HTTP/2 | ✅ ALPN on TLS; `http2_prior_knowledge` (arg or `clients.<n>.http2_prior_knowledge`) for cleartext h2c |
 | `async with` lifecycle | ✅ `__aenter__` / `__aexit__` |
 | `resp.raise_for_status()` | ✅ |

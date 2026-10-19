@@ -100,6 +100,14 @@ pub struct TlsConfig {
     /// TLS; absence disables it.
     #[serde(default)]
     pub client_ca: Option<String>,
+
+    /// Look at `cert_path`, `key_path` and `client_ca` every this many
+    /// seconds, and when one changed, serve new connections with the files
+    /// as they are now; connections already open keep theirs. Files that
+    /// do not load are logged and the previous ones kept. Without it the
+    /// files are read once, when the listener binds.
+    #[serde(default)]
+    pub reload_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
@@ -147,6 +155,13 @@ pub struct ClientConfig {
     /// redirect or follow it on its own terms. Default: on.
     #[serde(default = "default_follow_redirects")]
     pub follow_redirects: bool,
+
+    /// Look at `verify`, `cert` and `key` at most every this many seconds,
+    /// on the next request, and when one changed, build the pool again
+    /// from the files as they are now. Files that do not load are logged
+    /// and the previous pool kept. Without it they are read once.
+    #[serde(default)]
+    pub reload_seconds: Option<u64>,
 }
 
 fn default_max_body() -> usize {

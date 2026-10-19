@@ -44,6 +44,8 @@ pub mod outbound;
 #[cfg(test)]
 mod outbound_tests;
 pub mod parse;
+#[cfg(test)]
+mod reload_tests;
 pub mod request;
 pub mod response;
 pub mod runtime;

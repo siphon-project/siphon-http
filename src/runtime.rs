@@ -731,7 +731,7 @@ pub(crate) struct BoundListener {
     /// What routes and handlers call this listener.
     name: String,
     socket: tokio::net::TcpSocket,
-    tls: Option<(axum_server::tls_rustls::RustlsConfig, Sha256)>,
+    tls: Option<(axum_server::tls_rustls::RustlsConfig, Sha256, TlsConfig)>,
 }
 
 /// Parse the address, load any TLS material, and bind the socket.
@@ -744,7 +744,9 @@ pub(crate) fn bind_listener(server: &ServerConfig) -> Result<BoundListener, List
     let tls = server
         .tls
         .as_ref()
-        .map(build_rustls_config)
+        .map(|settings| {
+            build_rustls_config(settings).map(|(config, sha256)| (config, sha256, settings.clone()))
+        })
         .transpose()
         .map_err(fail)?;
 
@@ -787,8 +789,11 @@ impl BoundListener {
             tls: self.tls.is_some(),
         });
         let server = axum_server::from_tcp(listener)?;
-        if let Some((config, sha256)) = self.tls {
+        if let Some((config, sha256, settings)) = self.tls {
             tracing::info!(target: "siphon_http", listen = %addr, name = %identity.name, tls = true, "serving HTTPS listener");
+            if let Some(seconds) = settings.reload_seconds.filter(|seconds| *seconds > 0) {
+                tokio::spawn(reload_listener(config.clone(), settings, seconds, addr));
+            }
             let acceptor = TlsAcceptor {
                 listener: identity,
                 inner: axum_server::tls_rustls::RustlsAcceptor::new(config),
@@ -804,6 +809,54 @@ impl BoundListener {
     }
 }
 
+/// The modification times of a listener's TLS files.
+fn listener_stamps(tls: &TlsConfig) -> Vec<Option<std::time::SystemTime>> {
+    [
+        Some(&tls.cert_path),
+        Some(&tls.key_path),
+        tls.client_ca.as_ref(),
+    ]
+    .into_iter()
+    .map(|path| {
+        path.and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|metadata| metadata.modified().ok())
+    })
+    .collect()
+}
+
+/// Every `seconds`, when a TLS file of the listener changed, serve new
+/// connections with the files as they are now (`tls.reload_seconds`).
+async fn reload_listener(
+    config: axum_server::tls_rustls::RustlsConfig,
+    tls: TlsConfig,
+    seconds: u64,
+    addr: SocketAddr,
+) {
+    let mut seen = listener_stamps(&tls);
+    let mut interval = tokio::time::interval(Duration::from_secs(seconds));
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let now = listener_stamps(&tls);
+        if now == seen {
+            continue;
+        }
+        seen = now;
+        match build_server_config(&tls) {
+            Ok((server, _)) => {
+                config.reload_from_config(server);
+                tracing::info!(target: "siphon_http", listen = %addr, "listener TLS files changed: new connections use them");
+            }
+            Err(error) => tracing::error!(
+                target: "siphon_http",
+                listen = %addr,
+                %error,
+                "listener TLS files changed but do not load; the previous ones stay"
+            ),
+        }
+    }
+}
+
 /// Build the TLS config for a listener.
 ///
 /// Loads the server cert chain + key, wires client-certificate verification
@@ -813,6 +866,15 @@ impl BoundListener {
 fn build_rustls_config(
     tls: &TlsConfig,
 ) -> std::io::Result<(axum_server::tls_rustls::RustlsConfig, Sha256)> {
+    let (config, sha256) = build_server_config(tls)?;
+    Ok((
+        axum_server::tls_rustls::RustlsConfig::from_config(config),
+        sha256,
+    ))
+}
+
+/// The rustls server configuration of `tls`, read from its files now.
+fn build_server_config(tls: &TlsConfig) -> std::io::Result<(Arc<RustlsServerConfig>, Sha256)> {
     let certs = load_certs(&tls.cert_path)?;
     let key = load_key(&tls.key_path)?;
 
@@ -840,10 +902,7 @@ fn build_rustls_config(
     let mut config = builder.with_single_cert(certs, key).map_err(to_io)?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-    Ok((
-        axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(config)),
-        sha256,
-    ))
+    Ok((Arc::new(config), sha256))
 }
 
 fn load_certs(path: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
@@ -1171,6 +1230,7 @@ GOGGj2W2oE4Z0ETjIVryRGzZgKSWuJOtFQ==\n\
     fn bind_reports_a_missing_tls_certificate() {
         let mut config = server("127.0.0.1:0");
         config.tls = Some(TlsConfig {
+            reload_seconds: None,
             cert_path: "/nonexistent/siphon-http/server.crt".to_string(),
             key_path: "/nonexistent/siphon-http/server.key".to_string(),
             client_ca: None,

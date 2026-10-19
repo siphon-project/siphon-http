@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `servers[].tls.reload_seconds` and `clients.<name>.reload_seconds`:
+  certificates, keys and CA bundles replaced on disk are picked up without a
+  restart. A listener serves new connections with the new files, open ones
+  keep theirs; a pool is built again on its next request. Files that do not
+  load are logged and the previous ones kept.
+
 ## [2.1.0] — 2026-10-19
 
 ### Added

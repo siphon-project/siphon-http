@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-10-19
+
 ### Added
 
 - `HttpClient::named(&HttpConfig, name)`: the pool of `clients.<name>` for

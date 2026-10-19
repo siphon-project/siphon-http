@@ -146,6 +146,7 @@ clients:
     verify: "/etc/siphon/tls/ca.crt"
     pool_size: 16
     http2_prior_knowledge: false
+    follow_redirects: true
 ```
 
 | Key | Type | Description |
@@ -157,6 +158,7 @@ clients:
 | `cert` | string / pair | Optional. Client-certificate identity for mutual TLS — a combined PEM, or a `(cert, key)` pair. |
 | `pool_size` | int | Optional. Max pooled connections. |
 | `http2_prior_knowledge` | bool | Optional. Start cleartext connections directly in HTTP/2 (h2c) instead of HTTP/1.1. TLS uses ALPN regardless. |
+| `follow_redirects` | bool | Optional, default `true`: a 3xx is followed to its `Location` (up to 10 hops) inside the request. `false` returns the 3xx to the script as received, `Location` and the other headers included, to relay or follow itself. |
 
 Handlers can also build **inline** clients that don't need a config entry —
 `http.Client(base_url=…, verify=…, cert=…)`. Named clients are preferable for

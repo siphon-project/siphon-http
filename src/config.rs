@@ -140,6 +140,13 @@ pub struct ClientConfig {
     /// cleartext).
     #[serde(default)]
     pub http2_prior_knowledge: bool,
+
+    /// Follow a 3xx to its `Location` (up to 10 hops) inside the request, as
+    /// reqwest does by default. `false` hands the 3xx back to the script as
+    /// received, `Location` included: what a proxy needs to relay the
+    /// redirect or follow it on its own terms. Default: on.
+    #[serde(default = "default_follow_redirects")]
+    pub follow_redirects: bool,
 }
 
 fn default_max_body() -> usize {
@@ -153,6 +160,9 @@ fn default_client_timeout() -> u64 {
 }
 fn default_pool_size() -> usize {
     8
+}
+fn default_follow_redirects() -> bool {
+    true
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -418,6 +428,24 @@ mod tests {
             HttpConfig::from_yaml("clients:\n  api: {}\n  api:\n    pool_size: 3\n").unwrap_err();
         assert!(matches!(error, ConfigError::Parse { .. }), "{error:?}");
         assert!(error.to_string().contains("line 3"), "{error}");
+    }
+
+    #[test]
+    fn a_client_follows_redirects_unless_switched_off() {
+        let config = HttpConfig::from_yaml(
+            "clients:\n  plain: {}\n  relay:\n    follow_redirects: false\n  follow:\n    follow_redirects: true\n",
+        )
+        .unwrap();
+        assert!(config.clients["plain"].follow_redirects);
+        assert!(!config.clients["relay"].follow_redirects);
+        assert!(config.clients["follow"].follow_redirects);
+    }
+
+    #[test]
+    fn follow_redirects_takes_a_boolean_only() {
+        let error =
+            HttpConfig::from_yaml("clients:\n  p:\n    follow_redirects: sometimes\n").unwrap_err();
+        assert!(error.to_string().contains("follow_redirects"), "{error}");
     }
 
     #[test]

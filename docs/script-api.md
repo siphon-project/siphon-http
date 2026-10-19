@@ -222,6 +222,7 @@ Constructor keyword arguments:
 | `cert` | Client-cert identity for mTLS — a combined PEM or a `(cert, key)` pair. |
 | `timeout_ms` | Per-request timeout in milliseconds. |
 | `http2_prior_knowledge` | Start cleartext connections in h2c. |
+| `follow_redirects` | Default `True`. `False` returns a 3xx as received, `Location` included, instead of following it. |
 
 All request methods are coroutines returning a [`Response`](#httpresponse):
 

@@ -58,7 +58,7 @@ use crate::{HttpConfig, Request as PyRequest, Response as PyResponse, ServerConf
 
 static NAMED_CLIENTS: OnceLock<HashMap<String, ClientConfig>> = OnceLock::new();
 
-fn set_named_clients(clients: HashMap<String, ClientConfig>) {
+pub(crate) fn set_named_clients(clients: HashMap<String, ClientConfig>) {
     let _ = NAMED_CLIENTS.set(clients);
 }
 
@@ -643,14 +643,24 @@ async fn collect_body(body: Body) -> Result<Bytes, axum::Error> {
 /// Lower-cased names; a repeated header's values joined with ", " (RFC
 /// 9110 clause 5.3), for requests and for the responses of `http.Client`.
 pub(crate) fn headers_to_map(headers: &HeaderMap) -> HashMap<String, String> {
-    let mut out: HashMap<String, Vec<String>> = HashMap::new();
-    for (name, value) in headers {
-        let name = name.as_str().to_ascii_lowercase();
-        if let Ok(val) = value.to_str() {
-            out.entry(name).or_default().push(val.to_string());
+    joined_headers(headers).into_iter().collect()
+}
+
+/// [`headers_to_map`] in the order the names first appear. A value that is
+/// not visible ASCII is left out.
+pub(crate) fn joined_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(headers.keys_len());
+    for name in headers.keys() {
+        let values: Vec<&str> = headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        if !values.is_empty() {
+            out.push((name.as_str().to_ascii_lowercase(), values.join(", ")));
         }
     }
-    out.into_iter().map(|(k, vs)| (k, vs.join(", "))).collect()
+    out
 }
 
 fn convert_response(returned: Py<PyAny>) -> AxumResponse {

@@ -51,6 +51,36 @@ pub(crate) fn trusting(
     Ok(builder)
 }
 
+/// Hand a 3xx back as received instead of following it, unless `follow`.
+fn redirecting(builder: reqwest::ClientBuilder, follow: bool) -> reqwest::ClientBuilder {
+    if follow {
+        builder
+    } else {
+        builder.redirect(reqwest::redirect::Policy::none())
+    }
+}
+
+/// The builder of a named client, as `clients.<name>` configures it.
+pub(crate) fn pooled(cfg: &ClientConfig) -> PyResult<reqwest::ClientBuilder> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_millis(cfg.timeout_ms))
+        .pool_max_idle_per_host(cfg.pool_size);
+
+    builder = trusting(builder, cfg.verify.as_deref(), cfg.verify_only)
+        .map_err(PyRuntimeError::new_err)?;
+
+    if let (Some(cert_path), Some(key_path)) = (cfg.cert.as_deref(), cfg.key.as_deref()) {
+        let identity = identity_from_paths(cert_path, key_path)?;
+        builder = builder.identity(identity);
+    }
+
+    if cfg.http2_prior_knowledge {
+        builder = builder.http2_prior_knowledge();
+    }
+
+    Ok(redirecting(builder, cfg.follow_redirects))
+}
+
 #[pyclass(module = "siphon", name = "Client")]
 pub struct Client {
     inner: Arc<reqwest::Client>,
@@ -68,6 +98,7 @@ impl Client {
         timeout_ms=None,
         http2_prior_knowledge=false,
         verify_only=false,
+        follow_redirects=true,
     ))]
     fn new(
         name: Option<&str>,
@@ -77,6 +108,7 @@ impl Client {
         timeout_ms: Option<u64>,
         http2_prior_knowledge: bool,
         verify_only: bool,
+        follow_redirects: bool,
     ) -> PyResult<Self> {
         // Named-client lookup resolves against the install-time HttpConfig
         // stashed by the runtime (see `crate::runtime::set_named_clients`).
@@ -99,7 +131,7 @@ impl Client {
             builder = builder.http2_prior_knowledge();
         }
 
-        let inner = builder
+        let inner = redirecting(builder, follow_redirects)
             .build()
             .map_err(|e| PyRuntimeError::new_err(format!("build reqwest client: {e}")))?;
 
@@ -199,21 +231,7 @@ impl Client {
             ))
         })?;
 
-        let mut builder = reqwest::Client::builder()
-            .timeout(Duration::from_millis(cfg.timeout_ms))
-            .pool_max_idle_per_host(cfg.pool_size);
-
-        builder = trusting(builder, cfg.verify.as_deref(), cfg.verify_only)
-            .map_err(PyRuntimeError::new_err)?;
-
-        if let (Some(cert_path), Some(key_path)) = (cfg.cert.as_deref(), cfg.key.as_deref()) {
-            let identity = identity_from_paths(cert_path, key_path)?;
-            builder = builder.identity(identity);
-        }
-
-        if cfg.http2_prior_knowledge {
-            builder = builder.http2_prior_knowledge();
-        }
+        let builder = pooled(&cfg)?;
 
         let inner = builder
             .build()

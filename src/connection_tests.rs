@@ -689,3 +689,51 @@ async fn a_client_trusts_every_certificate_of_its_bundle_and_with_verify_only_no
     assert!(crate::client::trusting(reqwest::Client::builder(), None, true).is_err());
     std::fs::remove_dir_all(&directory).unwrap();
 }
+
+/// A named client follows a redirect by default, as reqwest does. With
+/// `follow_redirects: false` the 3xx comes back to the script as received,
+/// `Location` included, for it to relay or follow itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_named_client_follows_a_redirect_unless_told_not_to() {
+    let config = HttpConfig::from_yaml("servers:\n  - listen: \"127.0.0.1:0\"\n").unwrap();
+    let listener = bind_listener(&config.servers[0]).expect("the listener binds");
+    let address = listener.local_addr().unwrap();
+    let router = Router::new()
+        .route(
+            "/old",
+            any(|| async {
+                axum::response::Response::builder()
+                    .status(307)
+                    .header("location", "/new")
+                    .header("x-hop", "old")
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }),
+        )
+        .route("/new", any(|| async { "moved" }));
+    tokio::spawn(async move { listener.serve(router).await.expect("the listener serves") });
+
+    let send = |yaml: String| async move {
+        let config = HttpConfig::from_yaml(&yaml).unwrap();
+        let client = crate::client::pooled(&config.clients["p"])
+            .unwrap()
+            .build()
+            .unwrap();
+        for _ in 0..200 {
+            if let Ok(response) = client.get(format!("http://{address}/old")).send().await {
+                return response;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no answer from {address}");
+    };
+
+    let followed = send("clients:\n  p: {}\n".to_string()).await;
+    assert_eq!(followed.status().as_u16(), 200);
+    assert_eq!(followed.text().await.unwrap(), "moved");
+
+    let relayed = send("clients:\n  p:\n    follow_redirects: false\n".to_string()).await;
+    assert_eq!(relayed.status().as_u16(), 307);
+    assert_eq!(relayed.headers()["location"], "/new");
+    assert_eq!(relayed.headers()["x-hop"], "old");
+}

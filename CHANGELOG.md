@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `clients.<name>.verify_only` and `http.Client(verify_only=True)`: trust the
   `verify` bundle only, not the built-in roots.
+- `clients.<name>.follow_redirects` and `http.Client(follow_redirects=False)`:
+  hand a 3xx back to the script as received, `Location` included, instead of
+  following it inside the request. A proxy can then relay the redirect, or
+  follow it itself without the client dropping `Authorization` on a
+  cross-origin hop. Default on, as before.
 
 ### Fixed
 

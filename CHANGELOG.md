@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `servers[].dscp`: the Differentiated Services codepoint (RFC 2474) of a
+  listener's traffic, a number or a name (`ef`, `af41`, `cs6`, ...), set on
+  the listening socket. IPv4 listeners.
+
 ## [2.1.0] — 2026-10-19
 
 ### Added

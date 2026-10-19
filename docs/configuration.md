@@ -55,6 +55,7 @@ once.
 | `tls` | map | Optional. Present → the listener terminates TLS. Absent → plain HTTP. See [TLS](#tls-termination). |
 | `max_body_bytes` | int | Optional. Cap on the buffered request body. A larger body is rejected with `413 Payload Too Large`. |
 | `request_timeout_ms` | int | Optional. Per-request time budget in milliseconds. |
+| `dscp` | int or string | Optional. The DSCP (RFC 2474) the listener marks with: 0 to 63, or `ef`, `af11`…`af43`, `cs0`…`cs7`, `va`, `le`, `df`. Set on the listening socket, which accepted connections inherit. IPv4 listeners only; an IPv6 one with it does not bind. |
 
 HTTP/1.1 and HTTP/2 are both served on every listener automatically — there is
 no per-listener switch. See [HTTP/2](#http2).

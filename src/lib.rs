@@ -34,11 +34,19 @@
 //! body buffering, the outbound connection pool. Python handles: request
 //! dispatch, auth, content negotiation, business logic, response building.
 
+// The test harnesses drive tokio runtimes from the test thread, which never
+// attaches (`#[tokio::test]` itself expands to `Runtime::block_on`). The
+// library proper is still linted against parking waits in the non-test build.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod client;
 pub mod config;
 pub mod connection;
 #[cfg(test)]
 mod connection_tests;
+mod dispatch;
+#[cfg(test)]
+mod dispatch_tests;
 pub mod install;
 pub mod outbound;
 #[cfg(test)]
@@ -67,4 +75,49 @@ pub enum InstallError {
     Config(#[from] config::ConfigError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Hooks for `benches/dispatch.rs`. Not part of the API.
+#[doc(hidden)]
+pub mod __bench {
+    use std::sync::Arc;
+
+    use axum::http::Method;
+    use pyo3::prelude::*;
+
+    use crate::dispatch::Stage;
+    use crate::runtime::RouteOptions;
+
+    /// A router serving `GET /bench` with `handler` behind `middlewares`, each
+    /// a `(function, is_async)` pair.
+    pub fn router(
+        middlewares: Vec<(Py<PyAny>, bool)>,
+        handler: (Py<PyAny>, bool),
+    ) -> PyResult<axum::Router> {
+        let route = RouteOptions {
+            path: "/bench".to_string(),
+            methods: vec![Method::GET],
+            listeners: None,
+        };
+        let middlewares = middlewares
+            .into_iter()
+            .map(|(function, is_async)| Stage::new(function, is_async))
+            .collect();
+        let (router, _) = crate::runtime::build_router(
+            vec![(route, Stage::new(handler.0, handler.1))],
+            Arc::new(middlewares),
+            &crate::HttpConfig::default(),
+        )?;
+        Ok(router)
+    }
+
+    /// The `Request` a handler receives for these parts.
+    pub fn request(parts: &axum::http::request::Parts, body: Vec<u8>) -> crate::Request {
+        crate::runtime::request_from_parts(parts, body)
+    }
+
+    /// The HTTP response for a handler's `Response`.
+    pub fn response(response: &crate::Response) -> axum::response::Response {
+        crate::dispatch::build_axum_response(response)
+    }
 }

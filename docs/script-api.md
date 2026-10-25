@@ -51,6 +51,16 @@ async def order(req):
   serves it on every listener. See
   [Routes on one listener](configuration.md#routes-on-one-listener).
 
+!!! tip "`def` or `async def`"
+    A request runs through its middlewares and handler in one job on siphon's
+    Python executor. `def` stages run there, one after the other, and so does
+    an `async def` stage that never awaits. From the first stage that can
+    await, the rest of the chain runs as one coroutine on siphon's asyncio
+    pool, bounded by siphon's coroutine timeout, and holds no executor worker
+    while it waits. Awaiting I/O (`http.Client`, a cache lookup) is what
+    `async def` is for; a handler that does not await costs the same either
+    way.
+
 ### `@http.middleware`
 
 Registers a **request guard**. Middlewares run in registration order *before* the

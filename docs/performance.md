@@ -46,6 +46,39 @@ nothing HTTP-specific.
 !!! warning "Free-threaded CPython is experimental"
     Free-threaded CPython support is still stabilising; treat it as experimental.
 
+## One executor job per request
+
+A request runs through its middlewares and route handler as **one job on
+siphon's Python executor**: the `Request` object is built, every stage runs and
+the `Response` is read back inside a single interpreter attach. The tokio task
+that accepted the connection never attaches. On free-threaded CPython a thread
+that attaches takes part in every garbage-collector stop-the-world pause, so
+keeping the listener tasks off the interpreter means a pause cannot stall them.
+
+An `async def` stage that never awaits runs inline in the same job. One that
+awaits moves, with the stages after it, to siphon's asyncio pool as one
+coroutine.
+
+[`benches/dispatch.rs`](https://github.com/siphon-project/siphon-http/blob/main/benches/dispatch.rs)
+measures it against the previous dispatcher, which ran every stage as its own
+executor job and attached on the tokio worker around each one. Per request, at
+concurrency 1 (latency) and 64 (throughput), two runs each:
+
+| Route | Previous | One job |
+|---|---|---|
+| 3 middlewares, c1 | 26–29 µs | 10.6–11.8 µs |
+| 3 middlewares, c64 | 6.2 µs | 2.4 µs |
+| no middleware, c1 | 10.5–10.9 µs | 10.3–12.7 µs |
+| no middleware, c64 | 2.24 µs | 2.44 µs |
+| `async def` that never awaits, c64 | | 2.5 µs |
+| `async def` that awaits, c64 | | 7.6–7.8 µs |
+
+A route behind middleware gets about 2.5× faster. A bare route pays about 9 %
+at saturation: building the `Request` object moved from the tokio worker into
+the job, which is what keeps the worker off the interpreter. A handler that
+awaits pays for its asyncio task; write a handler that does not await as `def`
+or `async def`, the cost is the same.
+
 ## Scaling out vs. scaling up
 
 | Lever | How | Effect |

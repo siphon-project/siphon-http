@@ -1,6 +1,10 @@
 //! The outbound client from another crate: a configuration, a named pool,
 //! an HTTP/2 request. No Python interpreter, no server task.
 
+// `#[tokio::test]` and the harness block on a runtime from the test thread,
+// which never attaches.
+#![allow(clippy::disallowed_methods)]
+
 use std::net::TcpListener;
 
 use axum::{routing::any, Router};

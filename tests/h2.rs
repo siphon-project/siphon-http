@@ -7,6 +7,10 @@
 //! HTTP/2. This pins the Rust transport stack + its cargo features; no Python
 //! or script glue is involved.
 
+// `#[tokio::test]` and the harness block on a runtime from the test thread,
+// which never attaches.
+#![allow(clippy::disallowed_methods)]
+
 use std::net::{SocketAddr, TcpListener};
 use std::time::Duration;
 

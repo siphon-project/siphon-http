@@ -780,6 +780,17 @@ pub(crate) fn bind_listener(server: &ServerConfig) -> Result<BoundListener, List
     // sit in TIME_WAIT. Not on Windows, where it would allow port stealing.
     #[cfg(unix)]
     socket.set_reuseaddr(true).map_err(fail)?;
+    if let Some(dscp) = server.dscp {
+        if !addr.is_ipv4() {
+            return Err(fail(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "dscp is set on IPv4 listeners only",
+            )));
+        }
+        // The DS field is the upper six bits of the former TOS octet
+        // (RFC 2474 clause 3).
+        socket.set_tos_v4(u32::from(dscp.0) << 2).map_err(fail)?;
+    }
     socket.bind(addr).map_err(fail)?;
 
     Ok(BoundListener {
@@ -794,6 +805,12 @@ impl BoundListener {
     #[cfg(test)]
     pub(crate) fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    /// The TOS octet of the listening socket.
+    #[cfg(test)]
+    pub(crate) fn tos(&self) -> std::io::Result<u32> {
+        self.socket.tos_v4()
     }
 
     /// Start listening and serve `router` until the server stops.
@@ -963,6 +980,52 @@ fn to_io<E: std::fmt::Display>(e: E) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
+    /// RFC 2474 codepoints by number or by the names of RFC 2474 (CS),
+    /// RFC 2597 (AF), RFC 3246 (EF), RFC 5865 (VA) and RFC 8622 (LE), set
+    /// as the upper six bits of the listening socket's TOS octet; refused
+    /// out of range and on IPv6.
+    #[test]
+    fn a_listener_marks_with_its_dscp() {
+        use crate::config::Dscp;
+        for (name, value) in [
+            ("ef", 46),
+            ("EF", 46),
+            ("af11", 10),
+            ("af12", 12),
+            ("af13", 14),
+            ("af21", 18),
+            ("af31", 26),
+            ("af41", 34),
+            ("af43", 38),
+            ("cs0", 0),
+            ("cs3", 24),
+            ("cs6", 48),
+            ("cs7", 56),
+            ("va", 44),
+            ("le", 1),
+            ("df", 0),
+        ] {
+            assert_eq!(Dscp::named(name), Some(Dscp(value)), "{name}");
+        }
+        for name in ["af14", "af51", "af10", "cs8", "ef1", "x"] {
+            assert_eq!(Dscp::named(name), None, "{name}");
+        }
+        let yaml = |dscp: &str, listen: &str| {
+            crate::HttpConfig::from_yaml(&format!(
+                "servers:\n  - listen: \"{listen}\"\n    dscp: {dscp}\n"
+            ))
+        };
+        for (dscp, tos) in [("ef", 184), ("34", 136), ("cs0", 0)] {
+            let config = yaml(dscp, "127.0.0.1:0").unwrap();
+            let listener = super::bind_listener(&config.servers[0]).unwrap();
+            assert_eq!(listener.tos().unwrap(), tos, "{dscp}");
+        }
+        assert!(yaml("64", "127.0.0.1:0").is_err());
+        assert!(yaml("af99", "127.0.0.1:0").is_err());
+        let six = yaml("ef", "[::1]:0").unwrap();
+        assert!(super::bind_listener(&six.servers[0]).is_err());
+    }
+
     #[test]
     fn repeated_headers_are_joined_in_order() {
         let mut headers = super::HeaderMap::new();

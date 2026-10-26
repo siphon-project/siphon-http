@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   restart. A listener serves new connections with the new files, open ones
   keep theirs; a pool is built again on its next request. Files that do not
   load are logged and the previous ones kept.
+- `servers[].dscp`: the Differentiated Services codepoint (RFC 2474) of a
+  listener's traffic, a number or a name (`ef`, `af41`, `cs6`, ...), set on
+  the listening socket. IPv4 listeners.
 
 ## [2.1.0] — 2026-10-19
 

@@ -75,6 +75,66 @@ pub struct ServerConfig {
     /// reported to scripts as the client address. Empty = socket peer only.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+
+    /// The DSCP (RFC 2474) of what this listener sends: a codepoint 0 to 63
+    /// or its name (`ef`, `af11` to `af43`, `cs0` to `cs7`, `va`, `le`,
+    /// `df`). Set on the listening socket, from which accepted connections
+    /// take it. IPv4 listeners only.
+    #[serde(default)]
+    pub dscp: Option<Dscp>,
+}
+
+/// A Differentiated Services codepoint (RFC 2474 clause 3): six bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dscp(pub u8);
+
+impl Dscp {
+    /// The codepoint of a name of RFC 2474 (CS), RFC 2597 (AF), RFC 3246
+    /// (EF), RFC 5865 (VOICE-ADMIT) or RFC 8622 (LE), any case.
+    pub fn named(name: &str) -> Option<Self> {
+        let name = name.to_ascii_lowercase();
+        let value = match name.as_str() {
+            "df" | "default" => 0,
+            "le" => 1,
+            "ef" => 46,
+            "va" => 44,
+            _ => {
+                let digits = name
+                    .strip_prefix("cs")
+                    .or_else(|| name.strip_prefix("af"))?;
+                let digits: Vec<u8> = digits.bytes().map(|byte| byte.wrapping_sub(b'0')).collect();
+                match (name.starts_with("cs"), digits.as_slice()) {
+                    (true, [class]) if *class <= 7 => class * 8,
+                    // AFxy: class x 1 to 4, drop precedence y 1 to 3.
+                    (false, [class, drop]) if (1..=4).contains(class) && (1..=3).contains(drop) => {
+                        class * 8 + drop * 2
+                    }
+                    _ => return None,
+                }
+            }
+        };
+        Some(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for Dscp {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Given {
+            Number(u8),
+            Name(String),
+        }
+        match Given::deserialize(deserializer)? {
+            Given::Number(value) if value <= 63 => Ok(Self(value)),
+            Given::Number(value) => Err(serde::de::Error::custom(format!(
+                "dscp {value} is not a six-bit codepoint (0 to 63)"
+            ))),
+            Given::Name(name) => Self::named(&name).ok_or_else(|| {
+                serde::de::Error::custom(format!("dscp {name:?} is no codepoint name"))
+            }),
+        }
+    }
 }
 
 impl ServerConfig {

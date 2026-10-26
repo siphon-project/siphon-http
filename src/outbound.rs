@@ -125,8 +125,82 @@ impl Reply {
 /// A pooled outbound HTTP client. Cloning is cheap and shares the pool.
 #[derive(Debug, Clone)]
 pub struct HttpClient {
-    inner: reqwest::Client,
+    inner: Arc<Pool>,
     base_url: Option<Arc<str>>,
+}
+
+/// The reqwest client of a pool, built again when its TLS files change
+/// (`clients.<name>.reload_seconds`).
+#[derive(Debug)]
+struct Pool {
+    current: std::sync::RwLock<reqwest::Client>,
+    reload: Option<Reload>,
+}
+
+#[derive(Debug)]
+struct Reload {
+    settings: ClientConfig,
+    period: std::time::Duration,
+    /// When the files were last looked at, and what their modification
+    /// times were then.
+    seen: Mutex<(std::time::Instant, Vec<Option<std::time::SystemTime>>)>,
+}
+
+/// The modification times of the TLS files of `settings`.
+fn stamps(settings: &ClientConfig) -> Vec<Option<std::time::SystemTime>> {
+    [&settings.verify, &settings.cert, &settings.key]
+        .into_iter()
+        .map(|path| {
+            path.as_deref()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .and_then(|metadata| metadata.modified().ok())
+        })
+        .collect()
+}
+
+impl Pool {
+    fn fixed(client: reqwest::Client) -> Self {
+        Self {
+            current: std::sync::RwLock::new(client),
+            reload: None,
+        }
+    }
+
+    /// The client to send with: built again first when the period is over
+    /// and a TLS file changed since it was built.
+    fn client(&self) -> reqwest::Client {
+        if let Some(reload) = &self.reload {
+            let changed = {
+                let mut seen = reload.seen.lock().unwrap_or_else(PoisonError::into_inner);
+                if seen.0.elapsed() < reload.period {
+                    false
+                } else {
+                    let now = stamps(&reload.settings);
+                    seen.0 = std::time::Instant::now();
+                    let changed = now != seen.1;
+                    seen.1 = now;
+                    changed
+                }
+            };
+            if changed {
+                match crate::client::Client::pool(&reload.settings) {
+                    Ok(client) => {
+                        *self.current.write().unwrap_or_else(PoisonError::into_inner) = client;
+                        tracing::info!(target: "siphon_http", "client TLS files changed: pool built again");
+                    }
+                    Err(error) => tracing::error!(
+                        target: "siphon_http",
+                        %error,
+                        "client TLS files changed but do not load; the previous pool stays"
+                    ),
+                }
+            }
+        }
+        self.current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// The pools built so far, by client name, with the settings each was built
@@ -170,17 +244,29 @@ impl HttpClient {
                 })
             };
         }
-        let client = Self::from_parts(
-            crate::client::Client::pool(settings)?,
-            settings.base_url.as_deref(),
-        );
+        let built = crate::client::Client::pool(settings)?;
+        let pool = match settings.reload_seconds {
+            Some(seconds) if seconds > 0 => Pool {
+                current: std::sync::RwLock::new(built),
+                reload: Some(Reload {
+                    settings: settings.clone(),
+                    period: std::time::Duration::from_secs(seconds),
+                    seen: Mutex::new((std::time::Instant::now(), stamps(settings))),
+                }),
+            },
+            _ => Pool::fixed(built),
+        };
+        let client = Self {
+            inner: Arc::new(pool),
+            base_url: settings.base_url.as_deref().map(Arc::from),
+        };
         pools.insert(name.to_string(), (settings.clone(), client.clone()));
         Ok(client)
     }
 
     pub(crate) fn from_parts(inner: reqwest::Client, base_url: Option<&str>) -> Self {
         Self {
-            inner,
+            inner: Arc::new(Pool::fixed(inner)),
             base_url: base_url.map(Arc::from),
         }
     }
@@ -214,7 +300,7 @@ impl HttpClient {
             fields.append(field, value);
         }
 
-        let mut request = self.inner.request(method, url).headers(fields);
+        let mut request = self.inner.client().request(method, url).headers(fields);
         if let Some(body) = body {
             request = request.body(body);
         }

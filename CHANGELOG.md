@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.2.0] — 2026-10-26
+
 ### Added
 
 - `task_with_admission(cfg, admission)`: a Rust guard (`admission::Admission`)

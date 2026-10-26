@@ -8,8 +8,8 @@
 //!   cfg-readout helpers, and installs the real Rust `Request` / `Response` /
 //!   `Client` pyclasses over the module's Python prototypes.
 //! - [`task`] spawns the axum listener(s) on `script.tokio_handle()` and
-//!   dispatches inbound requests into registered handlers via
-//!   `script.call_handler(...)`.
+//!   runs each inbound request through its middlewares and handler in one
+//!   job on siphon's Python executor.
 //!
 //! Both must be registered: the namespace alone is inert (no listener), the
 //! task alone has no script handlers to dispatch to.

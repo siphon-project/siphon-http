@@ -2,9 +2,10 @@
 //! [`siphon::script::ScriptHandle`].
 //!
 //! Driven from [`crate::task`]: the engine hands us a [`ScriptHandle`] once
-//! the script is loaded. We snapshot the registered `http.*` handlers, build
-//! an axum router that dispatches each match into `script.call_handler(...)`,
-//! and bind the listeners configured in [`crate::HttpConfig`].
+//! the script is loaded. We snapshot the registered `http.*` handlers into
+//! Rust once, build an axum router that answers each match through one
+//! Python executor job (see [`crate::dispatch`]), and bind the listeners
+//! configured in [`crate::HttpConfig`].
 //!
 //! # Boundaries
 //!
@@ -31,7 +32,7 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, MatchedPath, Request as AxumRequest};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Response as AxumResponse;
 use axum::routing::{any, MethodRouter};
 use axum::Router;
@@ -48,8 +49,9 @@ use tower_http::timeout::TimeoutLayer;
 use crate::admission::Admission;
 use crate::config::ClientConfig;
 use crate::connection::{ConnectionInfo, ListenerIdentity, PlainAcceptor, Sha256, TlsAcceptor};
+use crate::dispatch::{attach, error_response, Route, Stage};
 use crate::parse::{extract_path_params, parse_query};
-use crate::{HttpConfig, Request as PyRequest, Response as PyResponse, ServerConfig, TlsConfig};
+use crate::{HttpConfig, Request as PyRequest, ServerConfig, TlsConfig};
 
 // ── Named outbound clients ───────────────────────────────────────────────
 //
@@ -154,12 +156,12 @@ pub fn spawn_with(cfg: HttpConfig, script: ScriptHandle, admission: Option<Arc<d
     // script reload) is a follow-up — it would also need to coordinate with
     // siphon's script reload path.
     let routes = script.handlers_for("http.route");
-    let middlewares = Arc::new(script.handlers_for("http.middleware"));
+    let middleware_handles = script.handlers_for("http.middleware");
     let startups = script.handlers_for("http.startup");
     tracing::info!(
         target: "siphon_http",
         routes = routes.len(),
-        middleware = middlewares.len(),
+        middleware = middleware_handles.len(),
         startup = startups.len(),
         "handlers registered from script"
     );
@@ -177,8 +179,37 @@ pub fn spawn_with(cfg: HttpConfig, script: ScriptHandle, admission: Option<Arc<d
         );
     }
 
+    // Read each handler's function and options into Rust once, here, so a
+    // request never has to attach to find them. A middleware that cannot be
+    // read is fatal: serving its routes without it would skip a guard.
+    let (routes, middlewares) = attach(|py| {
+        let routes = read_routes(py, &routes);
+        let middlewares = middleware_handles
+            .iter()
+            .map(|handle| Stage::from_handle(py, handle))
+            .collect::<PyResult<Vec<_>>>();
+        (routes, middlewares)
+    });
+    let middlewares = match middlewares {
+        Ok(middlewares) => Arc::new(middlewares),
+        Err(error) => {
+            tracing::error!(target: "siphon_http", %error, "http.middleware could not be read");
+            eprintln!(
+                "siphon-http: an http.middleware could not be read ({error}); refusing to start"
+            );
+            std::process::exit(1);
+        }
+    };
+
     let route_count = routes.len();
-    let (mut router, scopes) = build_router(routes, Arc::clone(&middlewares), &cfg, script.clone());
+    let (mut router, scopes) = match build_router(routes, middlewares, &cfg) {
+        Ok(built) => built,
+        Err(error) => {
+            tracing::error!(target: "siphon_http", %error, "http routes could not be built");
+            eprintln!("siphon-http: http routes could not be built ({error}); refusing to start");
+            std::process::exit(1);
+        }
+    };
     if let Some(admission) = admission {
         router = guarded(router, admission);
     }
@@ -267,33 +298,47 @@ fn guarded(router: Router, admission: Arc<dyn Admission>) -> Router {
     }))
 }
 
-fn build_router(
-    routes: Vec<HandlerHandle>,
-    middlewares: Arc<Vec<HandlerHandle>>,
-    cfg: &HttpConfig,
-    script: ScriptHandle,
-) -> (Router, Vec<(String, RouteScope)>) {
-    let mut by_path: HashMap<String, Vec<RouteEntry>> = HashMap::new();
-
-    for handler in routes {
-        let options = match Python::attach(|py| read_route_options(py, &handler)) {
-            Ok(options) => options,
+/// Each `@http.route` handler's options and function, read in one attach at
+/// startup. A route whose options are malformed is skipped with a warning.
+fn read_routes(py: Python<'_>, handles: &[HandlerHandle]) -> Vec<(RouteOptions, Stage)> {
+    let mut routes = Vec::with_capacity(handles.len());
+    for handle in handles {
+        let read = read_route_options(py, handle)
+            .and_then(|options| Ok((options, Stage::from_handle(py, handle)?)));
+        match read {
+            Ok(route) => routes.push(route),
             Err(e) => {
                 tracing::warn!(target: "siphon_http", error = %e, "skipping malformed http.route options");
+            }
+        }
+    }
+    routes
+}
+
+pub(crate) fn build_router(
+    routes: Vec<(RouteOptions, Stage)>,
+    middlewares: Arc<Vec<Stage>>,
+    cfg: &HttpConfig,
+) -> PyResult<(Router, Vec<(String, RouteScope)>)> {
+    let mut by_path: HashMap<String, Vec<RouteEntry>> = HashMap::new();
+
+    // One attach, at startup, to lay out each route's stages.
+    attach(|py| -> PyResult<()> {
+        for (options, handler) in routes {
+            if options.path.is_empty() {
                 continue;
             }
-        };
-        if options.path.is_empty() {
-            continue;
+            let route = Route::new(py, Arc::clone(&middlewares), handler)?;
+            by_path.entry(options.path).or_default().push(RouteEntry {
+                scope: RouteScope {
+                    methods: options.methods,
+                    listeners: options.listeners,
+                },
+                route: Arc::new(route),
+            });
         }
-        by_path.entry(options.path).or_default().push(RouteEntry {
-            scope: RouteScope {
-                methods: options.methods,
-                listeners: options.listeners,
-            },
-            handler,
-        });
-    }
+        Ok(())
+    })?;
 
     let scopes: Vec<(String, RouteScope)> = by_path
         .iter()
@@ -306,8 +351,7 @@ fn build_router(
 
     let mut router = Router::new();
     for (path, entries) in by_path {
-        let method_router = build_method_router(entries, Arc::clone(&middlewares), script.clone());
-        router = router.route(&path, method_router);
+        router = router.route(&path, build_method_router(entries));
     }
 
     // Body cap is per-listener but axum applies it as a layer on the whole
@@ -321,8 +365,10 @@ fn build_router(
         .max()
         .unwrap_or(1 << 20);
     // Router-wide (most permissive across listeners). Bounds the client's wait
-    // and returns 408; a Python handler already executing can't be cancelled
-    // mid-call, so the work may continue after the client is answered.
+    // and returns 504. A sync handler already executing can't be cancelled
+    // mid-call, so the work may continue after the client is answered; an
+    // async one runs on until it finishes or siphon's coroutine timeout ends
+    // it.
     let timeout = cfg
         .servers
         .iter()
@@ -336,7 +382,7 @@ fn build_router(
                 StatusCode::GATEWAY_TIMEOUT,
                 Duration::from_millis(timeout),
             ));
-    (router, scopes)
+    Ok((router, scopes))
 }
 
 /// What `@http.route(...)` registered for one handler.
@@ -409,7 +455,7 @@ impl RouteScope {
 
 struct RouteEntry {
     scope: RouteScope,
-    handler: HandlerHandle,
+    route: Arc<Route>,
 }
 
 /// What a path's handlers make of one request.
@@ -468,31 +514,24 @@ pub(crate) fn unknown_route_listeners<'a>(
     unknown
 }
 
-fn build_method_router(
-    entries: Vec<RouteEntry>,
-    middlewares: Arc<Vec<HandlerHandle>>,
-    script: ScriptHandle,
-) -> MethodRouter {
+fn build_method_router(entries: Vec<RouteEntry>) -> MethodRouter {
     // Single `any` dispatcher that picks the matching handler by method at
     // request time. Lets us handle multiple `@http.route` decorators for the
     // same path with different method sets without needing axum's typed
     // `.get(...).put(...)` wiring at build time.
     //
-    // Wrap the handlers in Arc: `HandlerHandle: Clone` calls `Py<T>::clone`
-    // under the hood, which panics when invoked from a tokio worker that hasn't
-    // called `Python::attach`. Cloning the Arc is a plain refcount bump.
-    let (scopes, handlers): (Vec<RouteScope>, Vec<HandlerHandle>) = entries
+    // The routes are behind `Arc`s: cloning one per request is a plain
+    // refcount bump, with no Python object touched on the tokio worker.
+    let (scopes, routes): (Vec<RouteScope>, Vec<Arc<Route>>) = entries
         .into_iter()
-        .map(|entry| (entry.scope, entry.handler))
+        .map(|entry| (entry.scope, entry.route))
         .unzip();
     let scopes = Arc::new(scopes);
-    let handlers = Arc::new(handlers);
+    let routes = Arc::new(routes);
     any(move |req: AxumRequest| {
         let scopes = Arc::clone(&scopes);
-        let handlers = Arc::clone(&handlers);
-        let middlewares = Arc::clone(&middlewares);
-        let script = script.clone();
-        async move { dispatch(req, scopes, handlers, middlewares, script).await }
+        let routes = Arc::clone(&routes);
+        async move { dispatch(req, scopes, routes).await }
     })
 }
 
@@ -526,16 +565,16 @@ impl RouteMatch {
 
 // ── Dispatch ─────────────────────────────────────────────────────────────
 
+/// Serve one request. Runs on a tokio worker and never attaches to Python:
+/// the stages run in one executor job (see [`crate::dispatch`]).
 async fn dispatch(
     req: AxumRequest,
     scopes: Arc<Vec<RouteScope>>,
-    handlers: Arc<Vec<HandlerHandle>>,
-    middlewares: Arc<Vec<HandlerHandle>>,
-    script: ScriptHandle,
+    routes: Arc<Vec<Arc<Route>>>,
 ) -> AxumResponse {
-    let handler = match route_gate(&scopes, &req) {
-        RouteMatch::Handler(index) => match handlers.get(index) {
-            Some(handler) => handler,
+    let route = match route_gate(&scopes, &req) {
+        RouteMatch::Handler(index) => match routes.get(index) {
+            Some(route) => Arc::clone(route),
             None => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
         },
         refused => return refused.refusal(),
@@ -550,44 +589,8 @@ async fn dispatch(
         }
     };
 
-    let py_request = request_from_parts(&parts, body_bytes.to_vec());
-
-    // Build the request pyclass once; share it (refcount clone) across every
-    // middleware plus the route handler.
-    let req_obj = match Python::attach(|py| -> PyResult<Py<PyAny>> {
-        Ok(Py::new(py, py_request)?.into_any())
-    }) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(target: "siphon_http", error = %e, "Py::new(Request) failed");
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
-        }
-    };
-
-    // Middleware chain: each runs before the route handler and may
-    // short-circuit by returning a Response; None continues.
-    for mw in middlewares.iter() {
-        let arg = Python::attach(|py| req_obj.clone_ref(py));
-        match script.call_handler(mw, vec![arg]).await {
-            Ok(ret) => match Python::attach(|py| middleware_outcome(py, &ret)) {
-                MwOutcome::Continue => {}
-                MwOutcome::Respond(resp) => return resp,
-            },
-            Err(e) => {
-                tracing::warn!(target: "siphon_http", error = %e, "http.middleware raised");
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "middleware error");
-            }
-        }
-    }
-
-    let arg = Python::attach(|py| req_obj.clone_ref(py));
-    match script.call_handler(handler, vec![arg]).await {
-        Ok(returned) => convert_response(returned),
-        Err(e) => {
-            tracing::warn!(target: "siphon_http", error = %e, "handler raised");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "handler error")
-        }
-    }
+    let request = request_from_parts(&parts, body_bytes.to_vec());
+    crate::dispatch::answer(route, request).await
 }
 
 /// The `Request` a handler receives, from the head of an HTTP request and its
@@ -628,33 +631,6 @@ pub(crate) fn request_from_parts(parts: &axum::http::request::Parts, body: Vec<u
     )
 }
 
-enum MwOutcome {
-    Continue,
-    Respond(AxumResponse),
-}
-
-/// Interpret a middleware's return value: `None` → continue the chain; a
-/// `Response` → short-circuit with it; anything else → 500 (script error).
-fn middleware_outcome(py: Python<'_>, ret: &Py<PyAny>) -> MwOutcome {
-    let bound = ret.bind(py);
-    if bound.is_none() {
-        return MwOutcome::Continue;
-    }
-    match bound.extract::<PyRef<PyResponse>>() {
-        Ok(resp) => MwOutcome::Respond(build_axum_response(&resp)),
-        Err(_) => {
-            tracing::warn!(
-                target: "siphon_http",
-                "http.middleware returned neither Response nor None"
-            );
-            MwOutcome::Respond(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "middleware must return Response or None",
-            ))
-        }
-    }
-}
-
 async fn collect_body(body: Body) -> Result<Bytes, axum::Error> {
     let collected = body.collect().await.map_err(axum::Error::new)?;
     Ok(collected.to_bytes())
@@ -681,44 +657,6 @@ pub(crate) fn joined_headers(headers: &HeaderMap) -> Vec<(String, String)> {
         }
     }
     out
-}
-
-fn convert_response(returned: Py<PyAny>) -> AxumResponse {
-    Python::attach(|py| {
-        let bound = returned.bind(py);
-        match bound.extract::<PyRef<PyResponse>>() {
-            Ok(resp) => build_axum_response(&resp),
-            Err(e) => {
-                tracing::warn!(target: "siphon_http", error = %e, "handler did not return Response");
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, "bad response")
-            }
-        }
-    })
-}
-
-fn build_axum_response(resp: &PyResponse) -> AxumResponse {
-    let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let mut builder = AxumResponse::builder().status(status);
-    for (k, v) in &resp.headers {
-        if let (Ok(name), Ok(val)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
-        ) {
-            builder = builder.header(name, val);
-        }
-    }
-    let body = Body::from(resp.body_bytes.clone());
-    builder
-        .body(body)
-        .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "build failed"))
-}
-
-fn error_response(status: StatusCode, msg: &str) -> AxumResponse {
-    AxumResponse::builder()
-        .status(status)
-        .header("content-type", "text/plain; charset=utf-8")
-        .body(Body::from(format!("{msg}\n")))
-        .unwrap()
 }
 
 // ── Listener bind ────────────────────────────────────────────────────────

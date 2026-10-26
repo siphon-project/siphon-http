@@ -24,6 +24,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   listener's traffic, a number or a name (`ef`, `af41`, `cs6`, ...), set on
   the listening socket. IPv4 listeners.
 
+### Changed
+
+- A request runs as one job on siphon's Python executor. Building the
+  `Request`, every `@http.middleware`, the route handler and reading back its
+  `Response` share one interpreter attach, and the listener task never
+  attaches. Before, each middleware and the handler was its own executor job,
+  and the listener task attached around every one of them (about ten attaches
+  for a route behind three middlewares). Measured with `benches/dispatch.rs`:
+  a route behind three middlewares is about 2.5x faster; a route with none
+  costs about 9 % more at saturation, because its `Request` object is now
+  built in the job instead of on the listener task.
+- An `async def` middleware or handler that cannot suspend (it never
+  awaits) runs inline in that job, with no asyncio task. One that can suspend
+  runs, together with every stage after it, as one coroutine on siphon's
+  asyncio pool, bounded by siphon's coroutine timeout, and no longer holds an
+  executor worker while it awaits.
+
+### Fixed
+
+- On free-threaded CPython, a garbage-collector stop-the-world pause can no
+  longer catch a tokio worker inside an attach made for a request: neither
+  request dispatch nor `http.Client` attaches on a worker any more.
+  `http.Client` makes its `Response` object when the awaitable completes,
+  off the worker, and `async with http.Client(...)` no longer attaches on
+  exit.
+
 ## [2.1.0] — 2026-10-19
 
 ### Added

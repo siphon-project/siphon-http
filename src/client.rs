@@ -17,6 +17,7 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use reqwest::Method;
+use siphon::script::blocking::awaitable;
 
 use crate::config::ClientConfig;
 use crate::outbound::{ClientError, HttpClient};
@@ -175,14 +176,16 @@ impl Client {
     }
 
     /// `async with http.Client(...) as c:`. Python's `async with` awaits both
-    /// __aenter__ and __aexit__, so they must return coroutines (i.e.
-    /// `Py<PyAny>` produced by `future_into_py`) rather than the bare value.
+    /// __aenter__ and __aexit__, so they must return awaitables (produced by
+    /// siphon's `awaitable`) rather than the bare value.
     ///
     /// reqwest's drop closes the pool, so __aexit__ has nothing to do beyond
     /// resolving to None — Python interprets a falsy return as "don't swallow
-    /// the exception", which is what we want.
+    /// the exception", which is what we want. Both futures hold Rust values
+    /// only; they are converted when the awaitable completes, on siphon's
+    /// completion threads.
     fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(slf) })
+        awaitable(py, async move { Ok(slf) })
     }
 
     fn __aexit__<'py>(
@@ -192,10 +195,7 @@ impl Client {
         _exc: Bound<'_, PyAny>,
         _tb: Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        pyo3_async_runtimes::tokio::future_into_py(
-            py,
-            async move { Python::attach(|py| Ok(py.None())) },
-        )
+        awaitable(py, async move { Ok(()) })
     }
 }
 
@@ -255,17 +255,20 @@ impl Client {
         let path = path.to_string();
         let headers: Vec<(String, String)> = headers.unwrap_or_default().into_iter().collect();
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        // The future runs on a tokio worker and holds no Python object: it
+        // resolves to the `Response` as Rust data, and siphon's `awaitable`
+        // makes the Python object when it completes the awaitable, on one of
+        // siphon's fixed completion threads rather than on the worker.
+        awaitable(py, async move {
             let reply = outbound
                 .request(method, path.as_str(), &headers, body)
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let py_resp = PyResponse {
+            Ok(PyResponse {
                 status: reply.status,
                 headers: reply.headers.into_iter().collect(),
                 body_bytes: reply.body,
-            };
-            Python::attach(|py| Ok(Py::new(py, py_resp)?.into_any()))
+            })
         })
     }
 }

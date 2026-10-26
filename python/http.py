@@ -66,7 +66,8 @@ def route(path, methods=None, listeners=None):
             None,
             fn,
             asyncio.iscoroutinefunction(fn),
-            {"path": path, "methods": methods, "listeners": listeners},
+            # `handler` is how the addon reaches the function itself.
+            {"path": path, "methods": methods, "listeners": listeners, "handler": fn},
         )
         return fn
 
@@ -87,7 +88,11 @@ def middleware(fn):
     is a roadmap item; for now do post-processing inside the route handler.)
     """
     _registry().register(
-        "http.middleware", None, fn, asyncio.iscoroutinefunction(fn), {}
+        "http.middleware",
+        None,
+        fn,
+        asyncio.iscoroutinefunction(fn),
+        {"handler": fn},
     )
     return fn
 

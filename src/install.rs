@@ -76,3 +76,16 @@ pub fn task(cfg: HttpConfig) -> impl FnOnce(siphon::script::ScriptHandle) + Send
         crate::runtime::spawn(cfg, script);
     }
 }
+
+/// [`task`], with a Rust guard deciding on every request a route serves
+/// before its body is read and before any `http.middleware` or handler,
+/// and adding header fields to the responses it let through (see
+/// [`crate::admission`]).
+pub fn task_with_admission(
+    cfg: HttpConfig,
+    admission: std::sync::Arc<dyn crate::admission::Admission>,
+) -> impl FnOnce(siphon::script::ScriptHandle) + Send + 'static {
+    move |script| {
+        crate::runtime::spawn_with(cfg, script, Some(admission));
+    }
+}

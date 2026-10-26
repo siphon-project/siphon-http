@@ -46,6 +46,7 @@ use siphon::script::{HandlerHandle, ScriptHandle};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
+use crate::admission::Admission;
 use crate::config::ClientConfig;
 use crate::connection::{ConnectionInfo, ListenerIdentity, PlainAcceptor, Sha256, TlsAcceptor};
 use crate::dispatch::{attach, error_response, Route, Stage};
@@ -135,6 +136,13 @@ fn client_addr(peer: Option<SocketAddr>, headers: &HeaderMap) -> String {
 /// on a SIP listener it cannot bind, because a route with no listener is
 /// unreachable while everything else about the process looks healthy.
 pub fn spawn(cfg: HttpConfig, script: ScriptHandle) {
+    spawn_with(cfg, script, None)
+}
+
+/// [`spawn`], with `admission` deciding on every request a route serves
+/// before its body is read and before any middleware or handler (see
+/// [`crate::admission`]).
+pub fn spawn_with(cfg: HttpConfig, script: ScriptHandle, admission: Option<Arc<dyn Admission>>) {
     set_named_clients(cfg.clients.clone());
     set_trusted_proxies(
         &cfg.servers
@@ -194,7 +202,7 @@ pub fn spawn(cfg: HttpConfig, script: ScriptHandle) {
     };
 
     let route_count = routes.len();
-    let (router, scopes) = match build_router(routes, middlewares, &cfg) {
+    let (mut router, scopes) = match build_router(routes, middlewares, &cfg) {
         Ok(built) => built,
         Err(error) => {
             tracing::error!(target: "siphon_http", %error, "http routes could not be built");
@@ -202,6 +210,9 @@ pub fn spawn(cfg: HttpConfig, script: ScriptHandle) {
             std::process::exit(1);
         }
     };
+    if let Some(admission) = admission {
+        router = guarded(router, admission);
+    }
 
     // A route restricted to a listener no `servers[]` entry has would be
     // served nowhere. That is a typo in the script or the config, and fatal
@@ -277,6 +288,15 @@ pub fn spawn(cfg: HttpConfig, script: ScriptHandle) {
 }
 
 // ── Router build ─────────────────────────────────────────────────────────
+
+/// `router` with `admission` on its routes: inside the request timeout and
+/// the body limit, before the body is read. A path no route has is answered
+/// 404 without it.
+fn guarded(router: Router, admission: Arc<dyn Admission>) -> Router {
+    router.route_layer(axum::middleware::from_fn(move |request, next| {
+        crate::admission::guard(Arc::clone(&admission), request, next)
+    }))
+}
 
 /// Each `@http.route` handler's options and function, read in one attach at
 /// startup. A route whose options are malformed is skipped with a warning.
@@ -669,7 +689,7 @@ pub(crate) struct BoundListener {
     /// What routes and handlers call this listener.
     name: String,
     socket: tokio::net::TcpSocket,
-    tls: Option<(axum_server::tls_rustls::RustlsConfig, Sha256)>,
+    tls: Option<(axum_server::tls_rustls::RustlsConfig, Sha256, TlsConfig)>,
 }
 
 /// Parse the address, load any TLS material, and bind the socket.
@@ -682,7 +702,9 @@ pub(crate) fn bind_listener(server: &ServerConfig) -> Result<BoundListener, List
     let tls = server
         .tls
         .as_ref()
-        .map(build_rustls_config)
+        .map(|settings| {
+            build_rustls_config(settings).map(|(config, sha256)| (config, sha256, settings.clone()))
+        })
         .transpose()
         .map_err(fail)?;
 
@@ -696,6 +718,17 @@ pub(crate) fn bind_listener(server: &ServerConfig) -> Result<BoundListener, List
     // sit in TIME_WAIT. Not on Windows, where it would allow port stealing.
     #[cfg(unix)]
     socket.set_reuseaddr(true).map_err(fail)?;
+    if let Some(dscp) = server.dscp {
+        if !addr.is_ipv4() {
+            return Err(fail(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "dscp is set on IPv4 listeners only",
+            )));
+        }
+        // The DS field is the upper six bits of the former TOS octet
+        // (RFC 2474 clause 3).
+        socket.set_tos_v4(u32::from(dscp.0) << 2).map_err(fail)?;
+    }
     socket.bind(addr).map_err(fail)?;
 
     Ok(BoundListener {
@@ -712,6 +745,12 @@ impl BoundListener {
         self.socket.local_addr()
     }
 
+    /// The TOS octet of the listening socket.
+    #[cfg(test)]
+    pub(crate) fn tos(&self) -> std::io::Result<u32> {
+        self.socket.tos_v4()
+    }
+
     /// Start listening and serve `router` until the server stops.
     pub(crate) async fn serve(self, router: Router) -> std::io::Result<()> {
         let listener = self.socket.listen(LISTEN_BACKLOG)?.into_std()?;
@@ -725,8 +764,11 @@ impl BoundListener {
             tls: self.tls.is_some(),
         });
         let server = axum_server::from_tcp(listener)?;
-        if let Some((config, sha256)) = self.tls {
+        if let Some((config, sha256, settings)) = self.tls {
             tracing::info!(target: "siphon_http", listen = %addr, name = %identity.name, tls = true, "serving HTTPS listener");
+            if let Some(seconds) = settings.reload_seconds.filter(|seconds| *seconds > 0) {
+                tokio::spawn(reload_listener(config.clone(), settings, seconds, addr));
+            }
             let acceptor = TlsAcceptor {
                 listener: identity,
                 inner: axum_server::tls_rustls::RustlsAcceptor::new(config),
@@ -742,6 +784,54 @@ impl BoundListener {
     }
 }
 
+/// The modification times of a listener's TLS files.
+fn listener_stamps(tls: &TlsConfig) -> Vec<Option<std::time::SystemTime>> {
+    [
+        Some(&tls.cert_path),
+        Some(&tls.key_path),
+        tls.client_ca.as_ref(),
+    ]
+    .into_iter()
+    .map(|path| {
+        path.and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|metadata| metadata.modified().ok())
+    })
+    .collect()
+}
+
+/// Every `seconds`, when a TLS file of the listener changed, serve new
+/// connections with the files as they are now (`tls.reload_seconds`).
+async fn reload_listener(
+    config: axum_server::tls_rustls::RustlsConfig,
+    tls: TlsConfig,
+    seconds: u64,
+    addr: SocketAddr,
+) {
+    let mut seen = listener_stamps(&tls);
+    let mut interval = tokio::time::interval(Duration::from_secs(seconds));
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let now = listener_stamps(&tls);
+        if now == seen {
+            continue;
+        }
+        seen = now;
+        match build_server_config(&tls) {
+            Ok((server, _)) => {
+                config.reload_from_config(server);
+                tracing::info!(target: "siphon_http", listen = %addr, "listener TLS files changed: new connections use them");
+            }
+            Err(error) => tracing::error!(
+                target: "siphon_http",
+                listen = %addr,
+                %error,
+                "listener TLS files changed but do not load; the previous ones stay"
+            ),
+        }
+    }
+}
+
 /// Build the TLS config for a listener.
 ///
 /// Loads the server cert chain + key, wires client-certificate verification
@@ -751,6 +841,15 @@ impl BoundListener {
 fn build_rustls_config(
     tls: &TlsConfig,
 ) -> std::io::Result<(axum_server::tls_rustls::RustlsConfig, Sha256)> {
+    let (config, sha256) = build_server_config(tls)?;
+    Ok((
+        axum_server::tls_rustls::RustlsConfig::from_config(config),
+        sha256,
+    ))
+}
+
+/// The rustls server configuration of `tls`, read from its files now.
+fn build_server_config(tls: &TlsConfig) -> std::io::Result<(Arc<RustlsServerConfig>, Sha256)> {
     let certs = load_certs(&tls.cert_path)?;
     let key = load_key(&tls.key_path)?;
 
@@ -778,10 +877,7 @@ fn build_rustls_config(
     let mut config = builder.with_single_cert(certs, key).map_err(to_io)?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-    Ok((
-        axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(config)),
-        sha256,
-    ))
+    Ok((Arc::new(config), sha256))
 }
 
 fn load_certs(path: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
@@ -822,6 +918,52 @@ fn to_io<E: std::fmt::Display>(e: E) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
+    /// RFC 2474 codepoints by number or by the names of RFC 2474 (CS),
+    /// RFC 2597 (AF), RFC 3246 (EF), RFC 5865 (VA) and RFC 8622 (LE), set
+    /// as the upper six bits of the listening socket's TOS octet; refused
+    /// out of range and on IPv6.
+    #[test]
+    fn a_listener_marks_with_its_dscp() {
+        use crate::config::Dscp;
+        for (name, value) in [
+            ("ef", 46),
+            ("EF", 46),
+            ("af11", 10),
+            ("af12", 12),
+            ("af13", 14),
+            ("af21", 18),
+            ("af31", 26),
+            ("af41", 34),
+            ("af43", 38),
+            ("cs0", 0),
+            ("cs3", 24),
+            ("cs6", 48),
+            ("cs7", 56),
+            ("va", 44),
+            ("le", 1),
+            ("df", 0),
+        ] {
+            assert_eq!(Dscp::named(name), Some(Dscp(value)), "{name}");
+        }
+        for name in ["af14", "af51", "af10", "cs8", "ef1", "x"] {
+            assert_eq!(Dscp::named(name), None, "{name}");
+        }
+        let yaml = |dscp: &str, listen: &str| {
+            crate::HttpConfig::from_yaml(&format!(
+                "servers:\n  - listen: \"{listen}\"\n    dscp: {dscp}\n"
+            ))
+        };
+        for (dscp, tos) in [("ef", 184), ("34", 136), ("cs0", 0)] {
+            let config = yaml(dscp, "127.0.0.1:0").unwrap();
+            let listener = super::bind_listener(&config.servers[0]).unwrap();
+            assert_eq!(listener.tos().unwrap(), tos, "{dscp}");
+        }
+        assert!(yaml("64", "127.0.0.1:0").is_err());
+        assert!(yaml("af99", "127.0.0.1:0").is_err());
+        let six = yaml("ef", "[::1]:0").unwrap();
+        assert!(super::bind_listener(&six.servers[0]).is_err());
+    }
+
     #[test]
     fn repeated_headers_are_joined_in_order() {
         let mut headers = super::HeaderMap::new();
@@ -1109,6 +1251,7 @@ GOGGj2W2oE4Z0ETjIVryRGzZgKSWuJOtFQ==\n\
     fn bind_reports_a_missing_tls_certificate() {
         let mut config = server("127.0.0.1:0");
         config.tls = Some(TlsConfig {
+            reload_seconds: None,
             cert_path: "/nonexistent/siphon-http/server.crt".to_string(),
             key_path: "/nonexistent/siphon-http/server.key".to_string(),
             client_ca: None,

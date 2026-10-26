@@ -61,6 +61,7 @@ extensions:
 | Routes on named listeners only | ✅ `servers[].name` + `@http.route(..., listeners=[…])`; `404` elsewhere |
 | Host of the request | ✅ `req.host` (`:authority` on HTTP/2, else `Host`) |
 | `@http.middleware` request guards | ✅ run before the route; return a `Response` to short-circuit |
+| Rust admission guard | ✅ `task_with_admission(config, guard)`: decides before the body is read and before any middleware, refuses with its own response or adds header fields to the handler's |
 | `@http.on_startup` | ✅ run to completion before any listener accepts |
 | `@http.on_shutdown` | ⏳ roadmap — needs a siphon shutdown hook for addon tasks (see below) |
 

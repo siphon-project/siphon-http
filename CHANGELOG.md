@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `task_with_admission(cfg, admission)`: a Rust guard (`admission::Admission`)
+  that decides on every request a route serves before its body is read and
+  before any `http.middleware` or handler. It refuses with a response of its
+  own, or lets the request through and adds header fields to the handler's
+  response; what it lets through it holds until the response is built, so it
+  can count the requests in progress.
+- `servers[].tls.reload_seconds` and `clients.<name>.reload_seconds`:
+  certificates, keys and CA bundles replaced on disk are picked up without a
+  restart. A listener serves new connections with the new files, open ones
+  keep theirs; a pool is built again on its next request. Files that do not
+  load are logged and the previous ones kept.
+- `servers[].dscp`: the Differentiated Services codepoint (RFC 2474) of a
+  listener's traffic, a number or a name (`ef`, `af41`, `cs6`, ...), set on
+  the listening socket. IPv4 listeners.
+
 ### Changed
 
 - A request runs as one job on siphon's Python executor. Building the

@@ -55,6 +55,7 @@ once.
 | `tls` | map | Optional. Present → the listener terminates TLS. Absent → plain HTTP. See [TLS](#tls-termination). |
 | `max_body_bytes` | int | Optional. Cap on the buffered request body. A larger body is rejected with `413 Payload Too Large`. |
 | `request_timeout_ms` | int | Optional. Per-request time budget in milliseconds. |
+| `dscp` | int or string | Optional. The DSCP (RFC 2474) the listener marks with: 0 to 63, or `ef`, `af11`…`af43`, `cs0`…`cs7`, `va`, `le`, `df`. Set on the listening socket, which accepted connections inherit. IPv4 listeners only; an IPv6 one with it does not bind. |
 
 HTTP/1.1 and HTTP/2 are both served on every listener automatically — there is
 no per-listener switch. See [HTTP/2](#http2).
@@ -83,6 +84,7 @@ servers:
 | `cert_path` | string | Server certificate chain (PEM). |
 | `key_path` | string | Server private key (PEM). |
 | `client_ca` | string | Optional. A CA bundle (PEM); its presence turns on **mutual TLS** — clients must present a certificate that chains to it. |
+| `reload_seconds` | int | Optional. Check `cert_path`, `key_path` and `client_ca` this often; when one changed, new connections get the files as they are now and open ones keep theirs. Files that do not load are logged and the previous ones stay. Without it the files are read once, at bind. |
 
 ### Mutual TLS (mTLS)
 
@@ -159,6 +161,7 @@ clients:
 | `pool_size` | int | Optional. Max pooled connections. |
 | `http2_prior_knowledge` | bool | Optional. Start cleartext connections directly in HTTP/2 (h2c) instead of HTTP/1.1. TLS uses ALPN regardless. |
 | `follow_redirects` | bool | Optional, default `true`: a 3xx is followed to its `Location` (up to 10 hops) inside the request. `false` returns the 3xx to the script as received, `Location` and the other headers included, to relay or follow itself. |
+| `reload_seconds` | int | Optional. On a request at most this often, check `verify`, `cert` and `key`; when one changed the pool is built again from them. Files that do not load are logged and the previous pool stays. Without it they are read once. |
 
 Rust code that links siphon-http reaches the same pool with
 `HttpClient::named(&config, "api")`, before or without the server task, and

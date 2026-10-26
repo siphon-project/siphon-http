@@ -45,6 +45,7 @@ use siphon::script::{HandlerHandle, ScriptHandle};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
+use crate::admission::Admission;
 use crate::config::ClientConfig;
 use crate::connection::{ConnectionInfo, ListenerIdentity, PlainAcceptor, Sha256, TlsAcceptor};
 use crate::parse::{extract_path_params, parse_query};
@@ -133,6 +134,13 @@ fn client_addr(peer: Option<SocketAddr>, headers: &HeaderMap) -> String {
 /// on a SIP listener it cannot bind, because a route with no listener is
 /// unreachable while everything else about the process looks healthy.
 pub fn spawn(cfg: HttpConfig, script: ScriptHandle) {
+    spawn_with(cfg, script, None)
+}
+
+/// [`spawn`], with `admission` deciding on every request a route serves
+/// before its body is read and before any middleware or handler (see
+/// [`crate::admission`]).
+pub fn spawn_with(cfg: HttpConfig, script: ScriptHandle, admission: Option<Arc<dyn Admission>>) {
     set_named_clients(cfg.clients.clone());
     set_trusted_proxies(
         &cfg.servers
@@ -170,7 +178,10 @@ pub fn spawn(cfg: HttpConfig, script: ScriptHandle) {
     }
 
     let route_count = routes.len();
-    let (router, scopes) = build_router(routes, Arc::clone(&middlewares), &cfg, script.clone());
+    let (mut router, scopes) = build_router(routes, Arc::clone(&middlewares), &cfg, script.clone());
+    if let Some(admission) = admission {
+        router = guarded(router, admission);
+    }
 
     // A route restricted to a listener no `servers[]` entry has would be
     // served nowhere. That is a typo in the script or the config, and fatal
@@ -246,6 +257,15 @@ pub fn spawn(cfg: HttpConfig, script: ScriptHandle) {
 }
 
 // ── Router build ─────────────────────────────────────────────────────────
+
+/// `router` with `admission` on its routes: inside the request timeout and
+/// the body limit, before the body is read. A path no route has is answered
+/// 404 without it.
+fn guarded(router: Router, admission: Arc<dyn Admission>) -> Router {
+    router.route_layer(axum::middleware::from_fn(move |request, next| {
+        crate::admission::guard(Arc::clone(&admission), request, next)
+    }))
+}
 
 fn build_router(
     routes: Vec<HandlerHandle>,

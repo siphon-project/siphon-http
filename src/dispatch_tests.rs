@@ -323,6 +323,50 @@ impl Drop for GarbageCollector {
     }
 }
 
+/// Set in CI, where the tests run on free-threaded CPython: a GIL interpreter
+/// there is a broken job, not a reason to skip.
+const REQUIRE_FREE_THREADED: &str = "SIPHON_HTTP_REQUIRE_FREE_THREADED";
+
+/// Whether the interpreter is free-threaded with the GIL off, which is the
+/// only place a garbage-collector stop-the-world parks other threads. A test
+/// about that pause calls this first and returns when it is false: on a GIL
+/// build the pause cannot stall anything, so the test would pass without
+/// testing. The skip goes straight to the process's stderr, past the test
+/// harness's output capture, so it shows in every run.
+fn free_threaded(test: &str) -> bool {
+    Python::initialize();
+    let (gil_disabled_build, gil_enabled) = Python::attach(|py| {
+        let build = py
+            .import("sysconfig")
+            .and_then(|sysconfig| sysconfig.call_method1("get_config_var", ("Py_GIL_DISABLED",)))
+            .and_then(|value| value.is_truthy())
+            .expect("sysconfig answers");
+        // A free-threaded build can still run with the GIL turned back on
+        // (PYTHON_GIL=1, or an extension that needs it).
+        let enabled = py
+            .import("sys")
+            .and_then(|sys| sys.call_method0("_is_gil_enabled"))
+            .and_then(|value| value.is_truthy())
+            .unwrap_or(true);
+        (build, enabled)
+    });
+    if gil_disabled_build && !gil_enabled {
+        return true;
+    }
+    let reason = if gil_disabled_build {
+        "free-threaded build running with the GIL enabled"
+    } else {
+        "not free-threaded"
+    };
+    assert!(
+        std::env::var_os(REQUIRE_FREE_THREADED).is_none(),
+        "{test}: {reason}, and {REQUIRE_FREE_THREADED} is set"
+    );
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "SKIP ({reason}): {test}");
+    false
+}
+
 /// `count` concurrent requests to each path, all within the deadline.
 fn hammer(router: &Router, paths: &[&str], count: usize) -> Vec<(u16, String)> {
     let router = router.clone();
@@ -473,6 +517,9 @@ fn script_errors_are_answered_with_500() {
 
 #[test]
 fn requests_complete_while_the_garbage_collector_stops_the_world() {
+    if !free_threaded("requests_complete_while_the_garbage_collector_stops_the_world") {
+        return;
+    }
     let _serial = serial();
     let bare = router(&[], &["where", "where_async"]);
     let guarded = router(
@@ -516,6 +563,9 @@ fn upstream() -> String {
 
 #[test]
 fn a_handler_awaiting_the_client_completes_while_the_world_stops() {
+    if !free_threaded("a_handler_awaiting_the_client_completes_while_the_world_stops") {
+        return;
+    }
     let _serial = serial();
     let base = upstream();
     let router = router(&["passes"], &["via_client"]);
@@ -563,6 +613,9 @@ fn a_handler_awaiting_the_client_completes_while_the_world_stops() {
 /// stops.
 #[test]
 fn a_script_coroutine_awaiting_the_client_completes_while_the_world_stops() {
+    if !free_threaded("a_script_coroutine_awaiting_the_client_completes_while_the_world_stops") {
+        return;
+    }
     let _serial = serial();
     let base = upstream();
     let pool = {

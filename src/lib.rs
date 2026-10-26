@@ -34,6 +34,7 @@
 //! body buffering, the outbound connection pool. Python handles: request
 //! dispatch, auth, content negotiation, business logic, response building.
 
+pub mod admission;
 pub mod client;
 pub mod config;
 pub mod connection;
@@ -44,6 +45,8 @@ pub mod outbound;
 #[cfg(test)]
 mod outbound_tests;
 pub mod parse;
+#[cfg(test)]
+mod reload_tests;
 pub mod request;
 pub mod response;
 pub mod runtime;
@@ -52,7 +55,7 @@ mod x509;
 pub use client::Client;
 pub use config::{ClientConfig, HttpConfig, ServerConfig, TlsConfig};
 pub use connection::{Listener, PeerCertificate, TlsInfo};
-pub use install::{namespace, task};
+pub use install::{namespace, task, task_with_admission};
 pub use outbound::{ClientError, HttpClient, Reply};
 pub use request::Request;
 pub use response::Response;

@@ -84,6 +84,7 @@ servers:
 | `cert_path` | string | Server certificate chain (PEM). |
 | `key_path` | string | Server private key (PEM). |
 | `client_ca` | string | Optional. A CA bundle (PEM); its presence turns on **mutual TLS** — clients must present a certificate that chains to it. |
+| `reload_seconds` | int | Optional. Check `cert_path`, `key_path` and `client_ca` this often; when one changed, new connections get the files as they are now and open ones keep theirs. Files that do not load are logged and the previous ones stay. Without it the files are read once, at bind. |
 
 ### Mutual TLS (mTLS)
 
@@ -160,6 +161,7 @@ clients:
 | `pool_size` | int | Optional. Max pooled connections. |
 | `http2_prior_knowledge` | bool | Optional. Start cleartext connections directly in HTTP/2 (h2c) instead of HTTP/1.1. TLS uses ALPN regardless. |
 | `follow_redirects` | bool | Optional, default `true`: a 3xx is followed to its `Location` (up to 10 hops) inside the request. `false` returns the 3xx to the script as received, `Location` and the other headers included, to relay or follow itself. |
+| `reload_seconds` | int | Optional. On a request at most this often, check `verify`, `cert` and `key`; when one changed the pool is built again from them. Files that do not load are logged and the previous pool stays. Without it they are read once. |
 
 Rust code that links siphon-http reaches the same pool with
 `HttpClient::named(&config, "api")`, before or without the server task, and

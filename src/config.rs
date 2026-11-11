@@ -34,6 +34,43 @@ pub struct HttpConfig {
     /// params; named clients are for shared connection pools.
     #[serde(default)]
     pub clients: HashMap<String, ClientConfig>,
+
+    /// Caps on the requests in progress on a route. Above its cap a route
+    /// answers 503 with `Retry-After` before the handler runs.
+    #[serde(default)]
+    pub limits: Vec<RouteLimit>,
+
+    /// Seconds for the `Retry-After` of a server error (5xx other than 501)
+    /// that has none: a handler that raised, a request that timed out. Unset
+    /// leaves such answers as they are.
+    #[serde(default)]
+    pub error_retry_after_seconds: Option<u32>,
+}
+
+/// A cap on the requests in progress on one route (see
+/// [`crate::overload`]): the 503 of a route above its cap carries
+/// `Retry-After` and a problem document with cause `NF_CONGESTION`
+/// (TS 29.500 clause 6.4.2.2).
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct RouteLimit {
+    /// The route pattern as `@http.route` registered it.
+    pub path: String,
+    /// The methods the cap counts; none listed is every method.
+    #[serde(default)]
+    pub methods: Vec<String>,
+    /// The listeners the cap applies on; unset is every listener.
+    #[serde(default)]
+    pub listeners: Option<Vec<String>>,
+    /// Requests in progress at most.
+    pub max_inflight: usize,
+    /// Seconds in the 503's `Retry-After`. Default: 1.
+    #[serde(default = "default_limit_retry_after")]
+    pub retry_after_seconds: u32,
+}
+
+fn default_limit_retry_after() -> u32 {
+    1
 }
 
 /// A single inbound listener.

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `limits[]` (`path`, `methods`, `listeners`, `max_inflight`,
+  `retry_after_seconds`): a route above its cap answers 503 with
+  `Retry-After` and a problem document with cause `NF_CONGESTION`, before the
+  handler runs.
+- `error_retry_after_seconds`: a 5xx (other than 501) without `Retry-After`,
+  a handler that raised included, gets one.
+- `admission::Admitted::decorate(status, headers)`: a response decorator that
+  sees every response of a route and its headers; `Inbound::route` is the
+  matched route pattern. `Admitted::respond` now has a default.
+
 ## [2.2.0] — 2026-10-26
 
 ### Added

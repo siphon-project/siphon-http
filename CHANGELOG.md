@@ -19,6 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sees every response of a route and its headers; `Inbound::route` is the
   matched route pattern. `Admitted::respond` now has a default.
 
+### Changed
+
+- `http.startup` hooks run through siphon's `call_handler_with`, so the task
+  that runs them no longer attaches to Python on a tokio worker. Outcome and
+  logging are unchanged.
+
+### Fixed
+
+- `TCP_NODELAY` is set on every accepted connection, cleartext and TLS. Without
+  it Nagle and the peer's delayed ACK caused rare 40 ms stalls (maximum 55-59 ms
+  against 23 ms with it, measured over h2c).
+
 ## [2.2.0] — 2026-10-26
 
 ### Added

@@ -367,6 +367,16 @@ impl PeerCertificate {
 type Accepting<Stream, Service> =
     Pin<Box<dyn Future<Output = io::Result<(Stream, Service)>> + Send>>;
 
+/// Send small writes at once instead of holding them for the peer's delayed
+/// ACK (Nagle). A response head and its body are separate writes, and the
+/// wait showed up as rare 40 ms stalls. A socket that refuses the option is
+/// still served.
+fn enable_nodelay(stream: &TcpStream) {
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::warn!(target: "siphon_http", %error, "could not set TCP_NODELAY");
+    }
+}
+
 /// The acceptor of a cleartext listener.
 #[derive(Clone)]
 pub(crate) struct PlainAcceptor {
@@ -382,6 +392,7 @@ where
     type Future = std::future::Ready<io::Result<(Self::Stream, Self::Service)>>;
 
     fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
+        enable_nodelay(&stream);
         let info = ConnectionInfo {
             listener: Arc::clone(&self.listener),
             local_addr: stream.local_addr().ok(),
@@ -409,6 +420,7 @@ where
     type Future = Accepting<Self::Stream, Self::Service>;
 
     fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
+        enable_nodelay(&stream);
         let local_addr = stream.local_addr().ok();
         let listener = Arc::clone(&self.listener);
         let sha256 = self.sha256;

@@ -266,7 +266,13 @@ pub fn spawn_with(cfg: HttpConfig, script: ScriptHandle, admission: Option<Arc<d
     runtime.spawn(async move {
         // Startup hooks run to completion before any listener accepts.
         for h in &startups {
-            if let Err(e) = script.call_handler(h, Vec::new()).await {
+            // Every touch of Python happens in the executor jobs: this task
+            // runs on a tokio worker and must not attach.
+            let outcome = script
+                .call_handler_with(h, |_py| Ok(Vec::new()), |_py, result| startup_outcome(result))
+                .await
+                .and_then(|outcome| outcome);
+            if let Err(e) = outcome {
                 tracing::error!(target: "siphon_http", error = %e, "http.startup handler raised");
             }
         }
@@ -285,6 +291,12 @@ pub fn spawn_with(cfg: HttpConfig, script: ScriptHandle, admission: Option<Arc<d
             let _ = t.await;
         }
     });
+}
+
+/// What an `http.startup` handler's outcome comes to: its return value is
+/// dropped, what it raised is kept for the log.
+fn startup_outcome(result: PyResult<Bound<'_, PyAny>>) -> PyResult<()> {
+    result.map(|_returned| ())
 }
 
 // ── Router build ─────────────────────────────────────────────────────────
@@ -862,7 +874,7 @@ async fn reload_listener(
 /// when `client_ca` is set (mutual TLS), and advertises ALPN `h2, http/1.1` so
 /// HTTP/2 negotiates over TLS. Pins the ring crypto provider explicitly to
 /// avoid ambiguity when more than one provider is linked.
-fn build_rustls_config(
+pub(crate) fn build_rustls_config(
     tls: &TlsConfig,
 ) -> std::io::Result<(axum_server::tls_rustls::RustlsConfig, Sha256)> {
     let (config, sha256) = build_server_config(tls)?;
@@ -942,6 +954,25 @@ fn to_io<E: std::fmt::Display>(e: E) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
+    use super::startup_outcome;
+    use pyo3::prelude::*;
+
+    /// A startup hook's return value is dropped and what it raises reaches
+    /// the log unchanged, as it did through `call_handler`.
+    #[test]
+    fn a_startup_outcome_keeps_what_the_handler_raised() {
+        Python::attach(|py| {
+            let returns = py.eval(c"(lambda: 42)()", None, None).expect("returns");
+            assert!(startup_outcome(Ok(returns)).is_ok());
+
+            let raised = py
+                .eval(c"(_ for _ in ()).throw(ValueError('boom'))", None, None)
+                .expect_err("raises");
+            let error = startup_outcome(Err(raised)).expect_err("the error is kept");
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            assert_eq!(error.value(py).to_string(), "boom");
+        });
+    }
     /// RFC 2474 codepoints by number or by the names of RFC 2474 (CS),
     /// RFC 2597 (AF), RFC 3246 (EF), RFC 5865 (VA) and RFC 8622 (LE), set
     /// as the upper six bits of the listening socket's TOS octet; refused

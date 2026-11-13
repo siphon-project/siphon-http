@@ -734,3 +734,63 @@ async fn a_named_client_follows_a_redirect_unless_told_not_to() {
     assert_eq!(relayed.headers()["location"], "/new");
     assert_eq!(relayed.headers()["x-hop"], "old");
 }
+
+// ── TCP_NODELAY ──────────────────────────────────────────────────────────
+
+fn test_identity(tls: bool) -> Arc<crate::connection::ListenerIdentity> {
+    Arc::new(crate::connection::ListenerIdentity {
+        name: "nodelay".to_string(),
+        tls,
+    })
+}
+
+/// A connected pair: the client end and the end the server accepted.
+async fn accepted_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    let (client, accepted) =
+        tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+    (client.expect("connect"), accepted.expect("accept").0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cleartext_connection_is_accepted_with_nodelay() {
+    use axum_server::accept::Accept;
+    let (_client, accepted) = accepted_pair().await;
+    assert!(!accepted.nodelay().expect("read nodelay"), "off by default");
+    let acceptor = crate::connection::PlainAcceptor {
+        listener: test_identity(false),
+    };
+    let (stream, _service) = acceptor.accept(accepted, ()).await.expect("accepts");
+    assert!(stream.nodelay().expect("read nodelay"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tls_connection_is_accepted_with_nodelay() {
+    use axum_server::accept::Accept;
+    let config = HttpConfig::from_yaml(&tls_yaml("nodelay", false)).expect("the test config");
+    let settings = config.servers[0].tls.as_ref().expect("a tls server");
+    let (rustls_config, sha256) = crate::runtime::build_rustls_config(settings).expect("tls");
+    let acceptor = crate::connection::TlsAcceptor {
+        listener: test_identity(true),
+        inner: axum_server::tls_rustls::RustlsAcceptor::new(rustls_config),
+        sha256,
+    };
+    let (client, accepted) = accepted_pair().await;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(
+        Client {
+            version: TLS13,
+            cipher_suite: rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+            identity: None,
+            alpn: None,
+        }
+        .config(),
+    ));
+    let name = ServerName::try_from("localhost").expect("a DNS name");
+    let handshake = connector.connect(name, client);
+    let (accepting, _client) = tokio::join!(acceptor.accept(accepted, ()), handshake);
+    let (stream, _service) = accepting.expect("accepts");
+    assert!(stream.get_ref().0.nodelay().expect("read nodelay"));
+}

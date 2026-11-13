@@ -142,6 +142,11 @@ async def where_async(req):
     return Response(status=200, body=f"worker={on_async_worker()}")
 
 
+async def slow(req):
+    await asyncio.sleep(0.4)
+    return Response(status=200, body=b"slow")
+
+
 async def never_awaits(req):
     return Response(status=201, body=thread_name())
 
@@ -222,6 +227,11 @@ fn stage(py: Python<'_>, name: &str) -> Stage {
 
 /// A router serving `GET /<handler>` for each handler, behind `middlewares`.
 fn router(middlewares: &[&str], handlers: &[&str]) -> Router {
+    router_with(&HttpConfig::default(), middlewares, handlers)
+}
+
+/// [`router`] built with `config`.
+fn router_with(config: &HttpConfig, middlewares: &[&str], handlers: &[&str]) -> Router {
     let (routes, middlewares) = Python::attach(|py| {
         let routes = handlers
             .iter()
@@ -239,7 +249,7 @@ fn router(middlewares: &[&str], handlers: &[&str]) -> Router {
         let middlewares = middlewares.iter().map(|name| stage(py, name)).collect();
         (routes, Arc::new(middlewares))
     });
-    build_router(routes, middlewares, &HttpConfig::default())
+    build_router(routes, middlewares, config)
         .expect("the router builds")
         .0
 }
@@ -826,4 +836,83 @@ fn no_awaitable_bypasses_siphon() {
         offenders.is_empty(),
         "use siphon::script::blocking::awaitable instead: {offenders:?}"
     );
+}
+
+fn config(yaml: &str) -> HttpConfig {
+    HttpConfig::from_yaml(yaml).expect("the config parses")
+}
+
+/// A handler that raises answers 500 with the configured Retry-After, as do
+/// the other error answers; without the setting there is none.
+#[test]
+fn a_handler_error_carries_the_configured_retry_after() {
+    let _serial = serial();
+    let with = router_with(
+        &config("error_retry_after_seconds: 2\n"),
+        &[],
+        &["raises", "where"],
+    );
+    let raised = get_status(&with, "/raises");
+    assert_eq!(raised, (500, Some("2".to_string())));
+    assert_eq!(get_status(&with, "/where"), (200, None));
+    let without = router(&[], &["raises"]);
+    assert_eq!(get_status(&without, "/raises"), (500, None));
+}
+
+/// `limits` caps the requests in progress on a route: the one over the cap is
+/// answered 503 with Retry-After and a problem document, before the handler
+/// runs, and the slot is free again afterwards.
+#[test]
+fn a_route_limit_refuses_beyond_max_inflight_with_503_and_retry_after() {
+    let _serial = serial();
+    let router = router_with(
+        &config("limits:\n  - path: /slow\n    max_inflight: 1\n    retry_after_seconds: 3\n"),
+        &[],
+        &["slow", "where"],
+    );
+    let answers = runtime().block_on(async {
+        let first = tokio::spawn({
+            let router = router.clone();
+            async move { raw(router, "/slow").await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let second = raw(router.clone(), "/slow").await;
+        let unlimited = raw(router.clone(), "/where").await;
+        (first.await.unwrap(), second, unlimited)
+    });
+    assert_eq!(answers.0 .0, 200);
+    assert_eq!(answers.1 .0, 503);
+    assert_eq!(answers.1 .1.as_deref(), Some("3"));
+    assert!(answers.1 .2.contains("NF_CONGESTION"), "{}", answers.1 .2);
+    assert_eq!(answers.2 .0, 200);
+    assert_eq!(get(&router, "/slow"), (200, "slow".to_string()));
+}
+
+async fn raw(router: Router, path: &str) -> (u16, Option<String>, String) {
+    let response = tokio::spawn({
+        let path = path.to_string();
+        async move {
+            let response = router
+                .oneshot(HttpRequest::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .map(|value| value.to_str().unwrap().to_owned());
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (
+                status,
+                retry_after,
+                String::from_utf8_lossy(&body).into_owned(),
+            )
+        }
+    });
+    response.await.unwrap()
+}
+
+fn get_status(router: &Router, path: &str) -> (u16, Option<String>) {
+    let (status, retry_after, _) = runtime().block_on(raw(router.clone(), path));
+    (status, retry_after)
 }

@@ -42,6 +42,34 @@ clients:
     pool_size: 16
 ```
 
+## `limits` and `error_retry_after_seconds`
+
+A server above its capacity should refuse early and say when to come back
+(RFC 9110 clause 10.2.3), not queue until the client's timer fires.
+
+```yaml
+limits:
+  - path: /nsmf-pdusession/v1/sm-contexts   # the pattern @http.route registered
+    methods: [POST]                         # optional; none is every method
+    listeners: [sbi]                        # optional; unset is every listener
+    max_inflight: 64
+    retry_after_seconds: 1                  # default 1
+error_retry_after_seconds: 1                # unset leaves 5xx answers as they are
+```
+
+A route over its `max_inflight` answers `503` with `Retry-After` and an
+`application/problem+json` document with `cause: NF_CONGESTION`
+(TS 29.500 clause 6.4.2.2), before the body is read and before any
+middleware or handler. `error_retry_after_seconds` gives `Retry-After` to a
+5xx (other than 501) that has none: a handler that raised, a request that
+timed out. A `Retry-After` a handler set itself stays.
+
+A Rust guard (`task_with_admission`) sees these answers too: its
+`Admitted::decorate(status, headers)` runs on every response of a route,
+those of the `limits` and a handler's error included, and may add or change
+header fields (load and overload information, say). `Inbound::route` is the
+pattern that matched.
+
 ## `servers`
 
 A list of listeners. Each entry is one socket; list several to serve, for

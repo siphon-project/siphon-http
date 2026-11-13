@@ -62,6 +62,7 @@ extensions:
 | Host of the request | ✅ `req.host` (`:authority` on HTTP/2, else `Host`) |
 | `@http.middleware` request guards | ✅ run before the route; return a `Response` to short-circuit |
 | Rust admission guard | ✅ `task_with_admission(config, guard)`: decides before the body is read and before any middleware, refuses with its own response or adds header fields to the handler's |
+| Overload answers | ✅ `limits[].max_inflight` (503 + `Retry-After` + `NF_CONGESTION` before the handler), `error_retry_after_seconds` (`Retry-After` on a 5xx), `Admitted::decorate` on every response |
 | `@http.on_startup` | ✅ run to completion before any listener accepts |
 | `@http.on_shutdown` | ⏳ roadmap — needs a siphon shutdown hook for addon tasks (see below) |
 

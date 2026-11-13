@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.3.0] — 2026-11-13
+
 ### Added
 
 - `limits[]` (`path`, `methods`, `listeners`, `max_inflight`,

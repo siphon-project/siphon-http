@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `TCP_NODELAY` is set on every accepted connection, cleartext and TLS. Without
+  it Nagle and the peer's delayed ACK caused rare 40 ms stalls (maximum 55-59 ms
+  against 23 ms with it, measured over h2c).
+
 ## [2.2.0] — 2026-10-26
 
 ### Added

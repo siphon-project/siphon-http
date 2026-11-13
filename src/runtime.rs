@@ -838,7 +838,7 @@ async fn reload_listener(
 /// when `client_ca` is set (mutual TLS), and advertises ALPN `h2, http/1.1` so
 /// HTTP/2 negotiates over TLS. Pins the ring crypto provider explicitly to
 /// avoid ambiguity when more than one provider is linked.
-fn build_rustls_config(
+pub(crate) fn build_rustls_config(
     tls: &TlsConfig,
 ) -> std::io::Result<(axum_server::tls_rustls::RustlsConfig, Sha256)> {
     let (config, sha256) = build_server_config(tls)?;

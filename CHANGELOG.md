@@ -7,17 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed
+### Added
 
-- `TCP_NODELAY` is set on every accepted connection, cleartext and TLS. Without
-  it Nagle and the peer's delayed ACK caused rare 40 ms stalls (maximum 55-59 ms
-  against 23 ms with it, measured over h2c).
+- `limits[]` (`path`, `methods`, `listeners`, `max_inflight`,
+  `retry_after_seconds`): a route above its cap answers 503 with
+  `Retry-After` and a problem document with cause `NF_CONGESTION`, before the
+  handler runs.
+- `error_retry_after_seconds`: a 5xx (other than 501) without `Retry-After`,
+  a handler that raised included, gets one.
+- `admission::Admitted::decorate(status, headers)`: a response decorator that
+  sees every response of a route and its headers; `Inbound::route` is the
+  matched route pattern. `Admitted::respond` now has a default.
 
 ### Changed
 
 - `http.startup` hooks run through siphon's `call_handler_with`, so the task
   that runs them no longer attaches to Python on a tokio worker. Outcome and
   logging are unchanged.
+
+### Fixed
+
+- `TCP_NODELAY` is set on every accepted connection, cleartext and TLS. Without
+  it Nagle and the peer's delayed ACK caused rare 40 ms stalls (maximum 55-59 ms
+  against 23 ms with it, measured over h2c).
 
 ## [2.2.0] — 2026-10-26
 

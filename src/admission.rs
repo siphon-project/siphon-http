@@ -37,7 +37,7 @@
 //! ```
 
 use axum::body::Body;
-use axum::extract::Request as AxumRequest;
+use axum::extract::{MatchedPath, Request as AxumRequest};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response as AxumResponse;
@@ -51,6 +51,9 @@ pub struct Inbound<'a> {
     pub listener: &'a str,
     pub method: &'a str,
     pub path: &'a str,
+    /// The route pattern that matched (`/items/{id}`), as the script
+    /// registered it.
+    pub route: &'a str,
     headers: &'a HeaderMap,
 }
 
@@ -78,7 +81,17 @@ pub trait Admitted: Send {
     /// Called once, when the handler answered; not called when the request
     /// ended without a response (the client went away, the handler timed
     /// out). The value is dropped right after either way.
-    fn respond(&mut self, status: u16) -> Vec<(String, String)>;
+    fn respond(&mut self, _status: u16) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// The response decorator: change the headers of the response, given its
+    /// status, after [`respond`](Admitted::respond). It sees every response
+    /// the routes produce, a handler error and a refusal of the route's
+    /// `limits` included, and can read what the handler set (to leave a
+    /// `Retry-After` it gave alone, say). The route it is for is the one
+    /// [`Inbound::route`] named when it was admitted.
+    fn decorate(&mut self, _status: u16, _headers: &mut HeaderMap) {}
 }
 
 pub enum Decision {
@@ -120,6 +133,11 @@ pub(crate) async fn guard(
     request: AxumRequest,
     next: Next,
 ) -> AxumResponse {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_owned())
+        .unwrap_or_default();
     let listener = request
         .extensions()
         .get::<ConnectionInfo>()
@@ -129,6 +147,7 @@ pub(crate) async fn guard(
         listener: &listener,
         method: request.method().as_str(),
         path: request.uri().path(),
+        route: &route,
         headers: request.headers(),
     });
     let mut admitted = match decision {
@@ -142,8 +161,10 @@ pub(crate) async fn guard(
         }
     };
     let mut response = next.run(request).await;
-    let fields = admitted.respond(response.status().as_u16());
+    let status = response.status().as_u16();
+    let fields = admitted.respond(status);
     append(response.headers_mut(), fields);
+    admitted.decorate(status, response.headers_mut());
     response
 }
 
@@ -285,5 +306,69 @@ mod tests {
                 ("GET".to_owned(), "/slow".to_owned(), None),
             ]
         );
+    }
+
+    /// Stamps every response with the route and status it saw, and drops a
+    /// Retry-After the handler set so its own takes over.
+    struct Decorator {
+        route: String,
+    }
+    impl Admitted for Decorator {
+        fn decorate(&mut self, status: u16, headers: &mut HeaderMap) {
+            headers.remove("retry-after");
+            headers.insert("x-route", HeaderValue::from_str(&self.route).unwrap());
+            headers.insert("x-seen-status", HeaderValue::from(status));
+            headers.insert("retry-after", HeaderValue::from_static("7"));
+        }
+    }
+    struct Decorating;
+    impl Admission for Decorating {
+        fn admit(&self, request: &Inbound<'_>) -> Decision {
+            Decision::Admit(Box::new(Decorator {
+                route: request.route.to_owned(),
+            }))
+        }
+    }
+
+    /// A response decorator sees the route pattern, the status and the
+    /// headers of every response the handler side produced, an error
+    /// included, and may change them.
+    #[tokio::test]
+    async fn a_decorator_sees_route_status_and_headers_of_every_response() {
+        let admission: Arc<dyn Admission> = Arc::new(Decorating);
+        let router = Router::new()
+            .route(
+                "/items/{id}",
+                any(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        [("retry-after", "1")],
+                        "boom",
+                    )
+                }),
+            )
+            .route("/fine", any(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn(move |request, next| {
+                guard(admission.clone(), request, next)
+            }));
+        let address = serve(router).await;
+        let client = reqwest::Client::new();
+        let failed = client
+            .get(format!("http://{address}/items/42"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), 500);
+        assert_eq!(failed.headers()["x-route"], "/items/{id}");
+        assert_eq!(failed.headers()["x-seen-status"], "500");
+        assert_eq!(failed.headers().get_all("retry-after").iter().count(), 1);
+        assert_eq!(failed.headers()["retry-after"], "7");
+        let fine = client
+            .get(format!("http://{address}/fine"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(fine.headers()["x-route"], "/fine");
+        assert_eq!(fine.headers()["x-seen-status"], "200");
     }
 }

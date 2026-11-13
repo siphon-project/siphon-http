@@ -363,7 +363,25 @@ pub(crate) fn build_router(
 
     let mut router = Router::new();
     for (path, entries) in by_path {
-        router = router.route(&path, build_method_router(entries));
+        let mut routes = build_method_router(entries);
+        for limit in cfg.limits.iter().filter(|limit| limit.path == path) {
+            let gate = crate::overload::Gate::new(
+                limit.max_inflight,
+                limit.retry_after_seconds,
+                limit
+                    .methods
+                    .iter()
+                    .filter_map(|method| {
+                        Method::from_bytes(method.to_ascii_uppercase().as_bytes()).ok()
+                    })
+                    .collect(),
+                limit.listeners.clone(),
+            );
+            routes = routes.layer(axum::middleware::from_fn(move |request, next| {
+                crate::overload::limit(Arc::clone(&gate), request, next)
+            }));
+        }
+        router = router.route(&path, routes);
     }
 
     // Body cap is per-listener but axum applies it as a layer on the whole
@@ -387,13 +405,19 @@ pub(crate) fn build_router(
         .map(|s| s.request_timeout_ms)
         .max()
         .unwrap_or(30_000);
-    let router =
+    let mut router =
         router
             .layer(RequestBodyLimitLayer::new(max_body))
             .layer(TimeoutLayer::with_status_code(
                 StatusCode::GATEWAY_TIMEOUT,
                 Duration::from_millis(timeout),
             ));
+    // Outermost, so the 504 of the timeout carries it too.
+    if let Some(seconds) = cfg.error_retry_after_seconds {
+        router = router.layer(axum::middleware::from_fn(move |request, next| {
+            crate::overload::retry_after(seconds, request, next)
+        }));
+    }
     Ok((router, scopes))
 }
 

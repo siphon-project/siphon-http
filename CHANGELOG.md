@@ -7,12 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Request timing on siphon's metrics registry, labelled by listener, method
+  and status class: `http_server_request_seconds`,
+  `http_server_handler_wait_seconds`, `http_server_handler_seconds`,
+  `http_server_async_handoff_wait_seconds` and the
+  `http_server_requests_in_flight` gauge. Every answer is timed, refusals
+  and timeouts included; metric updates run on the tokio task, never while
+  attached to Python. About 1 µs per request (`single_job_timed` in
+  `benches/dispatch.rs`).
+
 ### Fixed
 
 - `Response.headers` reuses a dict created on its first read. In-place mutations
   now affect the HTTP response; non-string keys or values produce a logged 500.
   From Rust, `Response::headers` is no longer a public field; read them with
   `Response::header_pairs(py)`.
+
+### Security
+
+- **Cargo.lock refresh**: hickory-net, hickory-proto and hickory-resolver
+  0.26.3 (pulled in by `siphon-sip`) for RUSTSEC-2026-0487 to -0491,
+  -0506 to -0509, -0513 to -0520 and -0539 to -0541: DNSSEC validation
+  bypasses, resolver retry and memory amplification, and parser panics.
 
 ## [2.3.0] — 2026-11-13
 

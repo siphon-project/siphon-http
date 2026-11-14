@@ -59,6 +59,7 @@ mod reload_tests;
 pub mod request;
 pub mod response;
 pub mod runtime;
+mod timing;
 mod x509;
 
 pub use client::Client;
@@ -91,6 +92,7 @@ pub mod __bench {
 
     use crate::dispatch::Stage;
     use crate::runtime::RouteOptions;
+    use crate::timing::Recorder;
 
     /// A router serving `GET /bench` with `handler` behind `middlewares`, each
     /// a `(function, is_async)` pair.
@@ -113,6 +115,20 @@ pub mod __bench {
             &crate::HttpConfig::default(),
         )?;
         Ok(router)
+    }
+
+    /// `router` with the request timing layer, recording on siphon's custom
+    /// metrics registry as a siphon binary does.
+    pub fn timed(router: axum::Router) -> Result<axum::Router, String> {
+        static RECORDER: std::sync::OnceLock<Result<Arc<dyn Recorder>, String>> =
+            std::sync::OnceLock::new();
+        let recorder = RECORDER.get_or_init(|| {
+            siphon::metrics::init().map_err(|error| error.to_string())?;
+            let metrics = siphon::metrics::custom_metrics()
+                .ok_or_else(|| "siphon's metrics registry is not initialised".to_string())?;
+            crate::timing::register(Arc::clone(metrics))
+        });
+        Ok(crate::timing::timed(router, Arc::clone(recorder.as_ref()?)))
     }
 
     /// The `Request` a handler receives for these parts.

@@ -23,6 +23,7 @@
 //! finished response.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
@@ -34,6 +35,8 @@ use siphon::script::async_pool::AsyncPool;
 use siphon::script::inline_dispatch::run_coroutine_inline;
 use siphon::script::HandlerHandle;
 use tokio::sync::oneshot;
+
+use crate::timing::{HandlerStamps, Handoff};
 
 use crate::{Request as PyRequest, Response as PyResponse};
 
@@ -110,9 +113,23 @@ impl Route {
 /// What the executor job made of a request.
 pub(crate) enum Started {
     /// Every stage ran in the job; this is the response.
-    Answered(Reply),
+    Answered(Reply, HandlerStamps),
     /// An `async def` stage took over; the response arrives here.
-    Pending(oneshot::Receiver<Reply>),
+    Pending(oneshot::Receiver<(Reply, HandlerStamps)>),
+}
+
+impl Started {
+    /// `reply`, answered in the job that started at `job_started`.
+    fn answered(reply: Reply, job_started: Instant) -> Self {
+        Started::Answered(
+            reply,
+            HandlerStamps {
+                job_started,
+                handoff: None,
+                finished: Instant::now(),
+            },
+        )
+    }
 }
 
 /// A response as the job hands it back. A script's `Response` is copied out
@@ -174,19 +191,17 @@ impl Reply {
 pub(crate) async fn answer(route: Arc<Route>, request: PyRequest) -> AxumResponse {
     let job = siphon::script::py_executor::try_run(move || attach(|py| start(py, &route, request)));
     match job.await {
-        Ok(Started::Answered(reply)) => reply.into_response(),
-        Ok(Started::Pending(receiver)) => {
-            receiver
-                .await
-                .map(Reply::into_response)
-                .unwrap_or_else(|_| {
-                    tracing::warn!(
-                        target: "siphon_http",
-                        "http handler coroutine ended without a response"
-                    );
-                    error_response(StatusCode::INTERNAL_SERVER_ERROR, "handler error")
-                })
-        }
+        Ok(Started::Answered(reply, stamps)) => stamped(reply, stamps),
+        Ok(Started::Pending(receiver)) => receiver
+            .await
+            .map(|(reply, stamps)| stamped(reply, stamps))
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    target: "siphon_http",
+                    "http handler coroutine ended without a response"
+                );
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "handler error")
+            }),
         Err(_) => {
             tracing::error!(
                 target: "siphon_http",
@@ -197,17 +212,27 @@ pub(crate) async fn answer(route: Arc<Route>, request: PyRequest) -> AxumRespons
     }
 }
 
+/// The response for `reply`, carrying its stamps to the timing layer.
+fn stamped(reply: Reply, stamps: HandlerStamps) -> AxumResponse {
+    let mut response = reply.into_response();
+    response.extensions_mut().insert(stamps);
+    response
+}
+
 /// The executor job: build the `Request` object and run the stages until one
 /// answers or an `async def` that can suspend takes over.
 pub(crate) fn start(py: Python<'_>, route: &Route, request: PyRequest) -> Started {
+    // A clock read, nothing else: the timing layer turns it into metrics on
+    // the tokio side.
+    let job_started = Instant::now();
     let request = match Py::new(py, request) {
         Ok(request) => request.into_any().into_bound(py),
         Err(error) => {
             tracing::error!(target: "siphon_http", %error, "Py::new(Request) failed");
-            return Started::Answered(Reply::error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error",
-            ));
+            return Started::answered(
+                Reply::error(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
+                job_started,
+            );
         }
     };
     let middlewares = route.middlewares.len();
@@ -220,22 +245,26 @@ pub(crate) fn start(py: Python<'_>, route: &Route, request: PyRequest) -> Starte
         let returned = match stage.callable.bind(py).call1((&request,)) {
             Ok(coroutine) if stage.is_async => match run_coroutine_inline(py, &coroutine) {
                 Ok(Some(value)) => Ok(value.into_bound(py)),
-                Ok(None) => return hand_off(py, route, index, &request, &coroutine),
+                Ok(None) => return hand_off(py, route, index, &request, &coroutine, job_started),
                 Err(error) => Err(error),
             },
             returned => returned,
         };
         match returned {
             Ok(value) if is_middleware && value.is_none() => continue,
-            Ok(value) => return Started::Answered(stage_response(&value, is_middleware)),
-            Err(error) => return Started::Answered(stage_raised(&error, is_middleware)),
+            Ok(value) => {
+                return Started::answered(stage_response(&value, is_middleware), job_started)
+            }
+            Err(error) => {
+                return Started::answered(stage_raised(&error, is_middleware), job_started)
+            }
         }
     }
     // The route handler is the last stage and always answers.
-    Started::Answered(Reply::error(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "internal error",
-    ))
+    Started::answered(
+        Reply::error(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
+        job_started,
+    )
 }
 
 /// Run the stages from `first` on as one coroutine on siphon's asyncio pool.
@@ -246,6 +275,7 @@ fn hand_off(
     first: usize,
     request: &Bound<'_, PyAny>,
     started: &Bound<'_, PyAny>,
+    job_started: Instant,
 ) -> Started {
     let (sender, receiver) = oneshot::channel();
     let submitted = (|| -> PyResult<()> {
@@ -254,6 +284,9 @@ fn hand_off(
             py,
             ResponseSink {
                 sender: Some(sender),
+                job_started,
+                submitted: Instant::now(),
+                began: None,
             },
         )?;
         let pool = AsyncPool::global();
@@ -289,10 +322,10 @@ fn hand_off(
             // Never awaited: close it so it is not reported as such.
             let _ = started.call_method0("close");
             tracing::error!(target: "siphon_http", %error, "could not start the http handler coroutine");
-            Started::Answered(Reply::error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error",
-            ))
+            Started::answered(
+                Reply::error(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
+                job_started,
+            )
         }
     }
 }
@@ -303,6 +336,7 @@ import asyncio
 
 
 async def drive(stages, first, request, sink, timeout, started):
+    sink.begin()
     is_middleware = stages[first][2]
     try:
         async with asyncio.timeout(timeout):
@@ -354,11 +388,22 @@ fn helpers(py: Python<'_>) -> PyResult<&Helpers> {
 /// attached.
 #[pyclass(module = "siphon_http", name = "_ResponseSink")]
 pub(crate) struct ResponseSink {
-    sender: Option<oneshot::Sender<Reply>>,
+    sender: Option<oneshot::Sender<(Reply, HandlerStamps)>>,
+    /// When the executor job started the stages.
+    job_started: Instant,
+    /// When the coroutine was handed to the asyncio pool.
+    submitted: Instant,
+    /// When the coroutine started on a pool loop.
+    began: Option<Instant>,
 }
 
 #[pymethods]
 impl ResponseSink {
+    /// The coroutine started running. A clock read only.
+    fn begin(&mut self) {
+        self.began.get_or_insert_with(Instant::now);
+    }
+
     fn respond(&mut self, value: &Bound<'_, PyAny>, is_middleware: bool) {
         self.deliver(stage_response(value, is_middleware));
     }
@@ -371,10 +416,18 @@ impl ResponseSink {
 
 impl ResponseSink {
     fn deliver(&mut self, response: Reply) {
+        let stamps = HandlerStamps {
+            job_started: self.job_started,
+            handoff: self.began.map(|began| Handoff {
+                submitted: self.submitted,
+                began,
+            }),
+            finished: Instant::now(),
+        };
         if let Some(sender) = self.sender.take() {
             // The receiver is gone when the client was already answered (the
             // request timeout); nothing is waiting for this response.
-            let _ = sender.send(response);
+            let _ = sender.send((response, stamps));
         }
     }
 }

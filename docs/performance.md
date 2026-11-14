@@ -79,6 +79,37 @@ the job, which is what keeps the worker off the interpreter. A handler that
 awaits pays for its asyncio task; write a handler that does not await as `def`
 or `async def`, the cost is the same.
 
+## Request timing metrics
+
+siphon-http times every request it answers on siphon's metrics registry, next
+to siphon's own metrics. Labels are `listener` (the `servers[]` name),
+`method` (the nine standard methods, anything else `other`) and
+`status_class` (`2xx`, `5xx`, ...); never the path or anything from the
+request.
+
+| Metric | From | To |
+|---|---|---|
+| `http_server_request_seconds` | request head reaches the router | response body done (written, or dropped when the client went away) |
+| `http_server_handler_wait_seconds` | request head reaches the router | the Python executor starts the middlewares and handler |
+| `http_server_handler_seconds` | first middleware (or the handler) called | the reply produced |
+| `http_server_async_handoff_wait_seconds` | an `async def` stage that awaits is handed to the asyncio pool | its coroutine starts on a pool loop |
+| `http_server_requests_in_flight` (gauge, `listener` only) | request head reaches the router | response body done |
+
+`request_seconds` covers every answer: the 404 of an unknown path, the 503 of
+a `limits` entry or the admission guard, the 504 of the request timeout. The
+handler metrics are only recorded when a handler ran. So
+`request − handler_wait − handler` is the time spent writing the response,
+`handler_wait` is the executor queue, and `async_handoff_wait` is the asyncio
+pool's queue, which `handler_seconds` includes.
+
+The executor job and the asyncio hand-off only read the clock; every metric
+update happens on the tokio task, never while attached to Python. The cost is
+about 1 µs per request at saturation (`single_job_timed` in
+`benches/dispatch.rs`, against `single_job`). siphon caps each metric at 128
+label sets, which is about five listeners using five methods each; once a
+metric is over the cap, further label sets are dropped and the first failure
+is logged.
+
 ## Scaling out vs. scaling up
 
 | Lever | How | Effect |

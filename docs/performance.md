@@ -48,16 +48,23 @@ nothing HTTP-specific.
 
 ## One executor job per request
 
-A request runs through its middlewares and route handler as **one job on
+A route whose stages are all `def` runs as **one job on
 siphon's Python executor**: the `Request` object is built, every stage runs and
 the `Response` is read back inside a single interpreter attach. The tokio task
 that accepted the connection never attaches. On free-threaded CPython a thread
 that attaches takes part in every garbage-collector stop-the-world pause, so
 keeping the listener tasks off the interpreter means a pause cannot stall them.
 
-An `async def` stage that never awaits runs inline in the same job. One that
-awaits moves, with the stages after it, to siphon's asyncio pool as one
-coroutine.
+A route with an `async def` stage runs its stages as one coroutine, started
+the way siphon starts a script's own `async def` handler
+(`ScriptHandle::start_coroutine`). It is built and first stepped in an
+executor job, and finishes there if it never suspends. One that awaits only
+siphon's awaitables (`http.Client`, siphon's own async APIs) is resumed by the
+executor as each completes: no asyncio task, no hop to an asyncio thread. One
+that uses asyncio itself is handed to siphon's asyncio driver, and that route
+starts there from then on. Each route's coroutine is its own code object, so
+one route that uses asyncio does not move the others. siphon's coroutine
+timeout bounds all of them; a request past it is cancelled and answered 500.
 
 [`benches/dispatch.rs`](https://github.com/siphon-project/siphon-http/blob/main/benches/dispatch.rs)
 measures it against the previous dispatcher, which ran every stage as its own
@@ -75,9 +82,21 @@ concurrency 1 (latency) and 64 (throughput), two runs each:
 
 A route behind middleware gets about 2.5× faster. A bare route pays about 9 %
 at saturation: building the `Request` object moved from the tokio worker into
-the job, which is what keeps the worker off the interpreter. A handler that
-awaits pays for its asyncio task; write a handler that does not await as `def`
-or `async def`, the cost is the same.
+the job, which is what keeps the worker off the interpreter.
+
+For an `async def` handler that awaits a siphon awaitable
+(`single_job_async_siphon`), the direct path against the asyncio pool it
+replaced, same siphon, two runs each (GIL build, so the absolute numbers are
+high and noisy):
+
+| Route | asyncio pool | Direct |
+|---|---|---|
+| no middleware, c1 | 76–108 µs | 26–28 µs |
+| no middleware, c64 | 75–151 µs | 12.3–12.9 µs |
+| 3 middlewares, c64 | 62–153 µs | 12.6–13.3 µs |
+
+A handler that uses asyncio itself (`single_job_async`) still runs on the
+driver; at c64 it costs what it did.
 
 ## Request timing metrics
 
@@ -92,17 +111,16 @@ request.
 | `http_server_request_seconds` | request head reaches the router | response body done (written, or dropped when the client went away) |
 | `http_server_handler_wait_seconds` | request head reaches the router | the Python executor starts the middlewares and handler |
 | `http_server_handler_seconds` | first middleware (or the handler) called | the reply produced |
-| `http_server_async_handoff_wait_seconds` | an `async def` stage that awaits is handed to the asyncio pool | its coroutine starts on a pool loop |
 | `http_server_requests_in_flight` (gauge, `listener` only) | request head reaches the router | response body done |
 
 `request_seconds` covers every answer: the 404 of an unknown path, the 503 of
 a `limits` entry or the admission guard, the 504 of the request timeout. The
 handler metrics are only recorded when a handler ran. So
-`request − handler_wait − handler` is the time spent writing the response,
-`handler_wait` is the executor queue, and `async_handoff_wait` is the asyncio
-pool's queue, which `handler_seconds` includes.
+`request − handler_wait − handler` is the time spent writing the response and
+`handler_wait` is the executor queue. A coroutine's awaits, and the executor
+queue each resume waits in, are part of `handler_seconds`.
 
-The executor job and the asyncio hand-off only read the clock; every metric
+The executor only reads the clock; every metric
 update happens on the tokio task, never while attached to Python. The cost is
 about 1 µs per request at saturation (`single_job_timed` in
 `benches/dispatch.rs`, against `single_job`). siphon caps each metric at 128

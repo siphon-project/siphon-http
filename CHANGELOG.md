@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- A route with an `async def` stage runs as one coroutine started through
+  siphon's `ScriptHandle::start_coroutine`. One that awaits only siphon's
+  awaitables (`http.Client` included) is resumed by the executor, with no
+  asyncio task and no hop to an asyncio thread: about 5× less per request
+  in `benches/dispatch.rs` (`single_job_async_siphon`). One that uses asyncio
+  runs on siphon's asyncio driver as before, and only its own route does.
+  siphon's coroutine timeout bounds it in place of a per-request
+  `asyncio.timeout`. Needs siphon-sip with `ScriptHandle::start_coroutine`.
+
+### Removed
+
+- `http_server_async_handoff_wait_seconds`: async routes no longer hop to an
+  asyncio pool, so there is no hand-off to time. A coroutine's awaits are
+  part of `http_server_handler_seconds`.
+
 ## [3.0.0] — 2026-11-14
 
 ### Added

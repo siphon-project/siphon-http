@@ -93,12 +93,16 @@ pub mod __bench {
     use crate::dispatch::Stage;
     use crate::runtime::RouteOptions;
     use crate::timing::Recorder;
+    use siphon::script::engine::ScriptEngine;
+    use siphon::script::ScriptHandle;
 
     /// A router serving `GET /bench` with `handler` behind `middlewares`, each
-    /// a `(function, is_async)` pair.
+    /// a `(function, is_async)` pair. Coroutines start on a script engine of
+    /// the bench's own, on `runtime`.
     pub fn router(
         middlewares: Vec<(Py<PyAny>, bool)>,
         handler: (Py<PyAny>, bool),
+        runtime: tokio::runtime::Handle,
     ) -> PyResult<axum::Router> {
         let route = RouteOptions {
             path: "/bench".to_string(),
@@ -113,8 +117,36 @@ pub mod __bench {
             vec![(route, Stage::new(handler.0, handler.1))],
             Arc::new(middlewares),
             &crate::HttpConfig::default(),
+            script_handle(runtime)?,
         )?;
         Ok(router)
+    }
+
+    /// A handle onto a script engine with no handlers, made once.
+    fn script_handle(runtime: tokio::runtime::Handle) -> PyResult<&'static ScriptHandle> {
+        static HANDLE: std::sync::OnceLock<(ScriptEngine, ScriptHandle)> =
+            std::sync::OnceLock::new();
+        if let Some((_, handle)) = HANDLE.get() {
+            return Ok(handle);
+        }
+        let path =
+            std::env::temp_dir().join(format!("siphon-http-bench-{}.py", std::process::id()));
+        std::fs::write(&path, "# no handlers: the bench builds its routes\n")?;
+        let engine = ScriptEngine::new(&siphon::config::ScriptConfig {
+            path: path.to_string_lossy().into_owned(),
+            reload: siphon::config::ReloadMode::Sighup,
+            async_pool_size: None,
+            sync_pool_size: None,
+            sync_pool_max: None,
+            handler_stall_abort_secs: 30,
+            process_stall_abort_secs: 30,
+            handler_timeout_secs: None,
+            executor_queue_capacity: 8192,
+            include_paths: Vec::new(),
+        })
+        .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))?;
+        let handle = ScriptHandle::for_engine(&engine, runtime);
+        Ok(&HANDLE.get_or_init(|| (engine, handle)).1)
     }
 
     /// `router` with the request timing layer, recording on siphon's custom

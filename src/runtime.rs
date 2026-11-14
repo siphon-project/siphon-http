@@ -202,7 +202,7 @@ pub fn spawn_with(cfg: HttpConfig, script: ScriptHandle, admission: Option<Arc<d
     };
 
     let route_count = routes.len();
-    let (mut router, scopes) = match build_router(routes, middlewares, &cfg) {
+    let (mut router, scopes) = match build_router(routes, middlewares, &cfg, &script) {
         Ok(built) => built,
         Err(error) => {
             tracing::error!(target: "siphon_http", %error, "http routes could not be built");
@@ -335,6 +335,7 @@ pub(crate) fn build_router(
     routes: Vec<(RouteOptions, Stage)>,
     middlewares: Arc<Vec<Stage>>,
     cfg: &HttpConfig,
+    script: &ScriptHandle,
 ) -> PyResult<(Router, Vec<(String, RouteScope)>)> {
     let mut by_path: HashMap<String, Vec<RouteEntry>> = HashMap::new();
 
@@ -344,7 +345,7 @@ pub(crate) fn build_router(
             if options.path.is_empty() {
                 continue;
             }
-            let route = Route::new(py, Arc::clone(&middlewares), handler)?;
+            let route = Route::new(py, Arc::clone(&middlewares), handler, script.clone())?;
             by_path.entry(options.path).or_default().push(RouteEntry {
                 scope: RouteScope {
                     methods: options.methods,

@@ -2,9 +2,9 @@
 //!
 //! The outer router layer stamps a request when its head reaches the router
 //! and holds a guard until the response body is done (sent, or dropped when
-//! the client went away). The executor job and the asyncio hand-off only take
-//! `Instant`s; they travel back with the response as [`HandlerStamps`] and are
-//! turned into observations here, on the tokio task. No metric is ever
+//! the client went away). The executor job only takes `Instant`s; they travel
+//! back with the response as [`HandlerStamps`] and are turned into
+//! observations here, on the tokio task. No metric is ever
 //! updated while attached to Python.
 //!
 //! Labels are bounded: the listener name, the method (the nine standard ones,
@@ -33,8 +33,6 @@ pub(crate) const REQUEST_SECONDS: &str = "http_server_request_seconds";
 pub(crate) const HANDLER_WAIT_SECONDS: &str = "http_server_handler_wait_seconds";
 /// First stage called to the reply being produced.
 pub(crate) const HANDLER_SECONDS: &str = "http_server_handler_seconds";
-/// Hand-off to siphon's asyncio pool to the coroutine starting there.
-pub(crate) const ASYNC_HANDOFF_WAIT_SECONDS: &str = "http_server_async_handoff_wait_seconds";
 /// Requests between head received and body done, per listener.
 pub(crate) const REQUESTS_IN_FLIGHT: &str = "http_server_requests_in_flight";
 
@@ -56,7 +54,6 @@ pub(crate) enum Metric {
     Request,
     HandlerWait,
     Handler,
-    AsyncHandoffWait,
 }
 
 impl Metric {
@@ -65,7 +62,6 @@ impl Metric {
             Metric::Request => REQUEST_SECONDS,
             Metric::HandlerWait => HANDLER_WAIT_SECONDS,
             Metric::Handler => HANDLER_SECONDS,
-            Metric::AsyncHandoffWait => ASYNC_HANDOFF_WAIT_SECONDS,
         }
     }
 }
@@ -86,24 +82,13 @@ pub(crate) trait Recorder: Send + Sync {
 }
 
 /// The timestamps of a request's run through its stages, taken in the
-/// executor job and the asyncio hand-off and read back on the tokio task.
+/// executor and read back on the tokio task.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HandlerStamps {
     /// The executor job started running the stages.
     pub(crate) job_started: Instant,
-    /// An `async def` stage suspended and the rest ran on the asyncio pool.
-    pub(crate) handoff: Option<Handoff>,
     /// The reply was produced.
     pub(crate) finished: Instant,
-}
-
-/// The hop of a suspending stage onto siphon's asyncio pool.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Handoff {
-    /// The coroutine was submitted to the pool.
-    pub(crate) submitted: Instant,
-    /// The coroutine started running on a pool loop.
-    pub(crate) began: Instant,
 }
 
 /// The `method` label: a standard method by name, anything else `other`.
@@ -194,11 +179,7 @@ pub(crate) fn register(metrics: Arc<CustomMetrics>) -> Result<Arc<dyn Recorder>,
         ),
         (
             HANDLER_SECONDS,
-            "HTTP server handlers, middlewares included, from the first one called to the reply produced",
-        ),
-        (
-            ASYNC_HANDOFF_WAIT_SECONDS,
-            "HTTP server handlers that suspend, from the hand-off to the asyncio pool to the coroutine starting there",
+            "HTTP server handlers, middlewares included, from the first one called to the reply produced; a coroutine's awaits included",
         ),
     ];
     for (name, help) in histograms {
@@ -313,11 +294,6 @@ impl RequestGuard {
             .saturating_duration_since(stamps.job_started);
         self.recorder
             .observe(Metric::Handler, &labels, run.as_secs_f64());
-        if let Some(handoff) = stamps.handoff {
-            let wait = handoff.began.saturating_duration_since(handoff.submitted);
-            self.recorder
-                .observe(Metric::AsyncHandoffWait, &labels, wait.as_secs_f64());
-        }
     }
 }
 
@@ -383,12 +359,7 @@ mod tests {
             method: "GET",
             status_class: "2xx",
         };
-        for metric in [
-            Metric::Request,
-            Metric::HandlerWait,
-            Metric::Handler,
-            Metric::AsyncHandoffWait,
-        ] {
+        for metric in [Metric::Request, Metric::HandlerWait, Metric::Handler] {
             recorder.observe(metric, &labels, 0.004);
         }
         recorder.in_flight("sbi", 1.0);

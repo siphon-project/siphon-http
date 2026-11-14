@@ -1,28 +1,29 @@
 //! Running a request through its middlewares and route handler.
 //!
-//! Every request is one job on siphon's Python executor. That job builds the
-//! `Request` object, runs the middlewares in order and then the route
-//! handler, and turns what they return into the HTTP response, all inside a
-//! single attach to the interpreter. The axum task that accepted the request
-//! never touches Python: it submits the job and awaits its answer.
+//! A route whose stages are all plain `def` runs as one job on siphon's
+//! Python executor. That job builds the `Request` object, runs the
+//! middlewares in order and then the route handler, and turns what they
+//! return into the HTTP response, all inside a single attach to the
+//! interpreter. The axum task that accepted the request never touches
+//! Python: it submits the job and awaits its answer.
+//!
+//! A route with an `async def` stage runs as one coroutine (`drive` below)
+//! started through siphon's `ScriptHandle::start_coroutine`, the path a
+//! script's own `async def` handlers take. The coroutine is built and first
+//! stepped in an executor job; one that never suspends finishes there. One
+//! that awaits only siphon's awaitables (`http.Client`, siphon's own async
+//! APIs) is resumed by the executor as each completes, with no asyncio task
+//! and no hop to an asyncio thread. One that awaits anything else (asyncio
+//! itself) is handed to siphon's asyncio driver intact. Every one of them is
+//! bounded by siphon's coroutine timeout: on expiry it is cancelled and the
+//! request is answered 500.
 //!
 //! Keeping Python off the tokio workers matters on free-threaded CPython. A
 //! thread that attaches takes part in every stop-the-world pause the garbage
 //! collector makes, and a tokio worker parked in an attach stalls every task
-//! scheduled on it until the pause ends. Attaching once per request instead
-//! of once per stage also saves the attach and detach themselves.
-//!
-//! An `async def` stage whose coroutine provably cannot suspend also runs in
-//! the job, inline, without an asyncio task (siphon's
-//! `run_coroutine_inline`). One that can suspend cannot finish inside the job
-//! without blocking an attached thread on its awaits, so the job hands it to
-//! siphon's asyncio pool: that stage and every stage after it run as one
-//! coroutine on a pool loop, which delivers the response through a
-//! [`ResponseSink`]. Neither the executor worker nor the axum task waits on
-//! the coroutine while attached; the axum task awaits a channel holding the
-//! finished response.
+//! scheduled on it until the pause ends.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use axum::body::Body;
@@ -31,12 +32,9 @@ use axum::response::Response as AxumResponse;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::PyTuple;
-use siphon::script::async_pool::AsyncPool;
-use siphon::script::inline_dispatch::run_coroutine_inline;
-use siphon::script::HandlerHandle;
-use tokio::sync::oneshot;
+use siphon::script::{HandlerHandle, ScriptHandle};
 
-use crate::timing::{HandlerStamps, Handoff};
+use crate::timing::HandlerStamps;
 
 use crate::{Request as PyRequest, Response as PyResponse};
 
@@ -84,8 +82,14 @@ pub(crate) struct Route {
     middlewares: Arc<Vec<Stage>>,
     handler: Stage,
     /// Every stage as `(function, is_async, is_middleware)`, built once, for
-    /// the coroutine that runs the stages from the first `async def` on.
+    /// the coroutine of a route with an `async def` stage.
     stages: Py<PyTuple>,
+    /// Some stage is an `async def`: the route runs as a coroutine of this
+    /// route's own `drive` (see [`HELPERS_SOURCE`]).
+    is_async: bool,
+    drive: Py<PyAny>,
+    /// Where a coroutine is started.
+    script: ScriptHandle,
 }
 
 impl Route {
@@ -93,6 +97,7 @@ impl Route {
         py: Python<'_>,
         middlewares: Arc<Vec<Stage>>,
         handler: Stage,
+        script: ScriptHandle,
     ) -> PyResult<Self> {
         let mut entries = Vec::with_capacity(middlewares.len() + 1);
         for stage in middlewares.iter() {
@@ -102,33 +107,20 @@ impl Route {
         entries
             .push((handler.callable.bind(py).clone(), handler.is_async, false).into_pyobject(py)?);
         let stages = PyTuple::new(py, entries)?.unbind();
+        let is_async = handler.is_async || middlewares.iter().any(|stage| stage.is_async);
+        let drive = helpers(py)?
+            .make_drive
+            .bind(py)
+            .call1((handler.callable.bind(py),))?
+            .unbind();
         Ok(Self {
             middlewares,
             handler,
             stages,
+            is_async,
+            drive,
+            script,
         })
-    }
-}
-
-/// What the executor job made of a request.
-pub(crate) enum Started {
-    /// Every stage ran in the job; this is the response.
-    Answered(Reply, HandlerStamps),
-    /// An `async def` stage took over; the response arrives here.
-    Pending(oneshot::Receiver<(Reply, HandlerStamps)>),
-}
-
-impl Started {
-    /// `reply`, answered in the job that started at `job_started`.
-    fn answered(reply: Reply, job_started: Instant) -> Self {
-        Started::Answered(
-            reply,
-            HandlerStamps {
-                job_started,
-                handoff: None,
-                finished: Instant::now(),
-            },
-        )
     }
 }
 
@@ -189,25 +181,81 @@ impl Reply {
 /// Answer `request` through `route`. Called on a tokio worker; does not
 /// attach.
 pub(crate) async fn answer(route: Arc<Route>, request: PyRequest) -> AxumResponse {
+    if route.is_async {
+        return answer_coroutine(route, request).await;
+    }
     let job = siphon::script::py_executor::try_run(move || attach(|py| start(py, &route, request)));
     match job.await {
-        Ok(Started::Answered(reply, stamps)) => stamped(reply, stamps),
-        Ok(Started::Pending(receiver)) => receiver
-            .await
-            .map(|(reply, stamps)| stamped(reply, stamps))
-            .unwrap_or_else(|_| {
-                tracing::warn!(
-                    target: "siphon_http",
-                    "http handler coroutine ended without a response"
-                );
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, "handler error")
-            }),
+        Ok((reply, stamps)) => stamped(reply, stamps),
         Err(_) => {
             tracing::error!(
                 target: "siphon_http",
                 "http request could not run on the Python executor (queue full or job panicked)"
             );
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+/// Answer `request` through a route with an `async def` stage: its stages
+/// run as one `drive` coroutine, started the way siphon starts a script's
+/// own `async def` handler.
+async fn answer_coroutine(route: Arc<Route>, request: PyRequest) -> AxumResponse {
+    // Set by `build` when the executor job starts, read by `finish`.
+    let job_started = Arc::new(OnceLock::new());
+    let started = Arc::clone(&job_started);
+    let script = route.script.clone();
+    let outcome = script
+        .start_coroutine(
+            // siphon keys what it learns about asyncio use on the coroutine's
+            // code object; every route has its own `drive`, so that is the
+            // route. A key object would have to be cloned here, on a tokio
+            // worker, which cannot be done without attaching.
+            None,
+            move |py| {
+                // A clock read, nothing else: the timing layer turns it into
+                // metrics on the tokio side.
+                let _ = started.set(Instant::now());
+                let request = Py::new(py, request)?;
+                route.drive.bind(py).call1((route.stages.bind(py), request))
+            },
+            move |_py, outcome| {
+                let finished = Instant::now();
+                let reply = match outcome {
+                    Ok(value) => drive_outcome(&value),
+                    // Building or starting the coroutine failed, or it ran
+                    // past siphon's coroutine timeout and was cancelled.
+                    Err(error) => stage_raised(&error, false),
+                };
+                let stamps = HandlerStamps {
+                    job_started: job_started.get().copied().unwrap_or(finished),
+                    finished,
+                };
+                (reply, stamps)
+            },
+        )
+        .await;
+    match outcome {
+        Ok((reply, stamps)) => stamped(reply, stamps),
+        Err(error) => {
+            tracing::error!(
+                target: "siphon_http",
+                %error,
+                "http handler coroutine could not run on the Python executor"
+            );
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+/// The reply for what `drive` returned: `(value, is_middleware, raised)`.
+fn drive_outcome(outcome: &Bound<'_, PyAny>) -> Reply {
+    match outcome.extract::<(Bound<'_, PyAny>, bool, bool)>() {
+        Ok((error, is_middleware, true)) => stage_raised(&PyErr::from_value(error), is_middleware),
+        Ok((value, is_middleware, false)) => stage_response(&value, is_middleware),
+        Err(error) => {
+            tracing::error!(target: "siphon_http", %error, "http handler coroutine returned no outcome");
+            Reply::error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         }
     }
 }
@@ -219,20 +267,26 @@ fn stamped(reply: Reply, stamps: HandlerStamps) -> AxumResponse {
     response
 }
 
-/// The executor job: build the `Request` object and run the stages until one
-/// answers or an `async def` that can suspend takes over.
-pub(crate) fn start(py: Python<'_>, route: &Route, request: PyRequest) -> Started {
+/// The executor job of a route whose stages are all `def`: build the
+/// `Request` object and run the stages until one answers.
+pub(crate) fn start(py: Python<'_>, route: &Route, request: PyRequest) -> (Reply, HandlerStamps) {
     // A clock read, nothing else: the timing layer turns it into metrics on
     // the tokio side.
     let job_started = Instant::now();
+    let reply = run_stages(py, route, request);
+    let stamps = HandlerStamps {
+        job_started,
+        finished: Instant::now(),
+    };
+    (reply, stamps)
+}
+
+fn run_stages(py: Python<'_>, route: &Route, request: PyRequest) -> Reply {
     let request = match Py::new(py, request) {
         Ok(request) => request.into_any().into_bound(py),
         Err(error) => {
             tracing::error!(target: "siphon_http", %error, "Py::new(Request) failed");
-            return Started::answered(
-                Reply::error(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
-                job_started,
-            );
+            return Reply::error(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
         }
     };
     let middlewares = route.middlewares.len();
@@ -242,128 +296,54 @@ pub(crate) fn start(py: Python<'_>, route: &Route, request: PyRequest) -> Starte
         .chain(std::iter::once(&route.handler));
     for (index, stage) in stages.enumerate() {
         let is_middleware = index < middlewares;
-        let returned = match stage.callable.bind(py).call1((&request,)) {
-            Ok(coroutine) if stage.is_async => match run_coroutine_inline(py, &coroutine) {
-                Ok(Some(value)) => Ok(value.into_bound(py)),
-                Ok(None) => return hand_off(py, route, index, &request, &coroutine, job_started),
-                Err(error) => Err(error),
-            },
-            returned => returned,
-        };
-        match returned {
+        match stage.callable.bind(py).call1((&request,)) {
             Ok(value) if is_middleware && value.is_none() => continue,
-            Ok(value) => {
-                return Started::answered(stage_response(&value, is_middleware), job_started)
-            }
-            Err(error) => {
-                return Started::answered(stage_raised(&error, is_middleware), job_started)
-            }
+            Ok(value) => return stage_response(&value, is_middleware),
+            Err(error) => return stage_raised(&error, is_middleware),
         }
     }
     // The route handler is the last stage and always answers.
-    Started::answered(
-        Reply::error(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
-        job_started,
-    )
+    Reply::error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
 }
 
-/// Run the stages from `first` on as one coroutine on siphon's asyncio pool.
-/// `started` is the coroutine stage `first` already returned.
-fn hand_off(
-    py: Python<'_>,
-    route: &Route,
-    first: usize,
-    request: &Bound<'_, PyAny>,
-    started: &Bound<'_, PyAny>,
-    job_started: Instant,
-) -> Started {
-    let (sender, receiver) = oneshot::channel();
-    let submitted = (|| -> PyResult<()> {
-        let helpers = helpers(py)?;
-        let sink = Py::new(
-            py,
-            ResponseSink {
-                sender: Some(sender),
-                job_started,
-                submitted: Instant::now(),
-                began: None,
-            },
-        )?;
-        let pool = AsyncPool::global();
-        let timeout = pool
-            .as_ref()
-            .map(|pool| pool.coroutine_timeout().as_secs_f64());
-        let coroutine = helpers.drive.bind(py).call1((
-            route.stages.bind(py),
-            first,
-            request,
-            sink,
-            timeout,
-            started,
-        ))?;
-        let outcome = match &pool {
-            // The pool hands back the coroutine's result channel and its
-            // future. The sink carries the response, and the coroutine
-            // bounds itself with the pool's timeout, so neither is kept.
-            Some(pool) => pool.submit(py, &coroutine).map(drop),
-            // No pool (an embedding that never installed one): run the
-            // coroutine to completion here, on the executor thread. Python
-            // code reaches its safe points while it runs.
-            None => helpers.run.bind(py).call1((&coroutine,)).map(drop),
-        };
-        if outcome.is_err() {
-            let _ = coroutine.call_method0("close");
-        }
-        outcome
-    })();
-    match submitted {
-        Ok(()) => Started::Pending(receiver),
-        Err(error) => {
-            // Never awaited: close it so it is not reported as such.
-            let _ = started.call_method0("close");
-            tracing::error!(target: "siphon_http", %error, "could not start the http handler coroutine");
-            Started::answered(
-                Reply::error(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
-                job_started,
-            )
-        }
-    }
-}
-
-/// The Python side of [`hand_off`]: one coroutine per request.
+/// The coroutine a route with an `async def` stage runs as. It returns
+/// `(value, is_middleware, raised)` rather than raising, so the reply can
+/// tell a middleware's failure from the handler's. Cancellation (siphon's
+/// coroutine timeout) is not an `Exception` and passes through.
+///
+/// Every route gets its own copy of `drive` (`make_drive`): siphon sends a
+/// coroutine whose code once used asyncio straight to its asyncio driver from
+/// then on, and it knows the coroutine by its code object. With one shared
+/// `drive`, the first handler to use asyncio would move every route there.
+/// The copy's qualified name carries the handler's, which is what siphon logs
+/// when it moves one.
 const HELPERS_SOURCE: &str = r#"
-import asyncio
+import types
 
 
-async def drive(stages, first, request, sink, timeout, started):
-    sink.begin()
-    is_middleware = stages[first][2]
+def make_drive(handler):
+    name = getattr(handler, "__qualname__", "handler")
+    code = drive.__code__.replace(co_qualname=f"drive[{name}]")
+    return types.FunctionType(code, drive.__globals__, "drive")
+
+
+async def drive(stages, request):
+    is_middleware = False
     try:
-        async with asyncio.timeout(timeout):
-            for index in range(first, len(stages)):
-                handler, is_async, is_middleware = stages[index]
-                if started is not None:
-                    value = await started
-                    started = None
-                else:
-                    value = handler(request)
-                    if is_async:
-                        value = await value
-                if is_middleware and value is None:
-                    continue
-                sink.respond(value, is_middleware)
-                return
+        for handler, is_async, is_middleware in stages:
+            value = handler(request)
+            if is_async:
+                value = await value
+            if is_middleware and value is None:
+                continue
+            return (value, is_middleware, False)
     except Exception as error:
-        sink.raised(error, is_middleware)
-
-
-def run(coroutine):
-    asyncio.run(coroutine)
+        return (error, is_middleware, True)
+    return (None, False, False)
 "#;
 
 struct Helpers {
-    drive: Py<PyAny>,
-    run: Py<PyAny>,
+    make_drive: Py<PyAny>,
 }
 
 static HELPERS: PyOnceLock<Helpers> = PyOnceLock::new();
@@ -377,59 +357,9 @@ fn helpers(py: Python<'_>) -> PyResult<&Helpers> {
             c"siphon_http_dispatch",
         )?;
         Ok(Helpers {
-            drive: module.getattr("drive")?.unbind(),
-            run: module.getattr("run")?.unbind(),
+            make_drive: module.getattr("make_drive")?.unbind(),
         })
     })
-}
-
-/// Where a handler coroutine delivers its response. The conversion to an
-/// HTTP response happens here, on the asyncio thread that is already
-/// attached.
-#[pyclass(module = "siphon_http", name = "_ResponseSink")]
-pub(crate) struct ResponseSink {
-    sender: Option<oneshot::Sender<(Reply, HandlerStamps)>>,
-    /// When the executor job started the stages.
-    job_started: Instant,
-    /// When the coroutine was handed to the asyncio pool.
-    submitted: Instant,
-    /// When the coroutine started on a pool loop.
-    began: Option<Instant>,
-}
-
-#[pymethods]
-impl ResponseSink {
-    /// The coroutine started running. A clock read only.
-    fn begin(&mut self) {
-        self.began.get_or_insert_with(Instant::now);
-    }
-
-    fn respond(&mut self, value: &Bound<'_, PyAny>, is_middleware: bool) {
-        self.deliver(stage_response(value, is_middleware));
-    }
-
-    fn raised(&mut self, error: &Bound<'_, PyAny>, is_middleware: bool) {
-        let error = PyErr::from_value(error.clone());
-        self.deliver(stage_raised(&error, is_middleware));
-    }
-}
-
-impl ResponseSink {
-    fn deliver(&mut self, response: Reply) {
-        let stamps = HandlerStamps {
-            job_started: self.job_started,
-            handoff: self.began.map(|began| Handoff {
-                submitted: self.submitted,
-                began,
-            }),
-            finished: Instant::now(),
-        };
-        if let Some(sender) = self.sender.take() {
-            // The receiver is gone when the client was already answered (the
-            // request timeout); nothing is waiting for this response.
-            let _ = sender.send((response, stamps));
-        }
-    }
 }
 
 /// The response for what a stage returned. A middleware's `None` never gets

@@ -5,7 +5,9 @@
 //! - `single_job` is the dispatcher: one executor job, one attach, per
 //!   request; the tokio worker never attaches. `single_job_async_inline` is
 //!   an `async def` handler that never awaits (run inline in the job), and
-//!   `single_job_async` one that awaits (run on the asyncio pool).
+//!   `single_job_async` one that awaits asyncio (run on siphon's asyncio
+//!   driver), `single_job_async_siphon` one that awaits a siphon awaitable
+//!   (resumed by the executor).
 //!   `single_job_timed` is `single_job` behind the request timing layer,
 //!   recording on siphon's metrics registry.
 //! - `per_stage` reproduces the dispatcher this replaced: every middleware
@@ -56,6 +58,11 @@ async def handler_async(req):
 
 async def handler_inline(req):
     return Response(status=200, body=b"ok")
+
+
+async def handler_siphon(req):
+    await ready()
+    return Response(status=200, body=b"ok")
 "#;
 
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -95,6 +102,14 @@ struct Functions {
     handler: Py<PyAny>,
     handler_async: Py<PyAny>,
     handler_inline: Py<PyAny>,
+    handler_siphon: Py<PyAny>,
+}
+
+/// A siphon awaitable that completes at once: what a handler awaits when it
+/// calls `http.Client` or siphon's own async APIs.
+#[pyfunction]
+fn ready(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    siphon::script::blocking::awaitable(py, async move { Ok(()) })
 }
 
 fn functions() -> Functions {
@@ -102,6 +117,9 @@ fn functions() -> Functions {
         let module = PyModule::new(py, "siphon_http_dispatch_bench").unwrap();
         module
             .add("Response", py.get_type::<siphon_http::Response>())
+            .unwrap();
+        module
+            .add_function(wrap_pyfunction!(ready, &module).unwrap())
             .unwrap();
         let code = std::ffi::CString::new(SCRIPT).unwrap();
         py.run(code.as_c_str(), Some(&module.dict()), None).unwrap();
@@ -111,6 +129,7 @@ fn functions() -> Functions {
             handler: get("handler"),
             handler_async: get("handler_async"),
             handler_inline: get("handler_inline"),
+            handler_siphon: get("handler_siphon"),
         }
     })
 }
@@ -129,8 +148,12 @@ fn single_job(
         let middlewares = (0..middlewares)
             .map(|_| (clone(py, &functions.passes), false))
             .collect();
-        siphon_http::__bench::router(middlewares, (clone(py, handler), is_async))
-            .expect("the router builds")
+        siphon_http::__bench::router(
+            middlewares,
+            (clone(py, handler), is_async),
+            runtime().handle().clone(),
+        )
+        .expect("the router builds")
     })
 }
 
@@ -258,6 +281,10 @@ fn bench(c: &mut Criterion) {
             (
                 "single_job_async_inline",
                 single_job(&functions, middlewares, &functions.handler_inline, true),
+            ),
+            (
+                "single_job_async_siphon",
+                single_job(&functions, middlewares, &functions.handler_siphon, true),
             ),
             (
                 "single_job_async",

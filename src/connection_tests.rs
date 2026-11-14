@@ -527,10 +527,17 @@ fn registered_options(py: Python<'_>, call: &str) -> RouteOptions {
          registry = types.ModuleType('_siphon_registry')\n\
          registry.calls = []\n\
          registry.register = lambda *args: registry.calls.append(args)\n\
+         previous = sys.modules.get('_siphon_registry')\n\
          sys.modules['_siphon_registry'] = registry\n\
-         @{call}\n\
-         def handler(req):\n\
-         \x20   return None\n\
+         try:\n\
+         \x20   @{call}\n\
+         \x20   def handler(req):\n\
+         \x20       return None\n\
+         finally:\n\
+         \x20   if previous is None:\n\
+         \x20       del sys.modules['_siphon_registry']\n\
+         \x20   else:\n\
+         \x20       sys.modules['_siphon_registry'] = previous\n\
          options = registry.calls[-1][4]\n"
     ))
     .unwrap();
@@ -544,6 +551,8 @@ fn registered_options(py: Python<'_>, call: &str) -> RouteOptions {
 
 #[test]
 fn the_decorator_registers_the_listeners_of_a_route() {
+    // Before attaching: the lock is held by threads that then attach.
+    let _registry = crate::dispatch_tests::registry_swap();
     Python::attach(|py| {
         // As every script written so far calls it: no restriction.
         let plain = registered_options(py, "http.route('/hello', methods=['get'])");

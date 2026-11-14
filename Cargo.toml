@@ -27,8 +27,9 @@ default = []
 # match byte-for-byte across every crate that depends on siphon-sip in one build
 # graph (e.g. siphon-bin), or cargo resolves two separate copies. branch=main
 # tracks the latest lib; the consumer's Cargo.lock still pins a concrete SHA.
-# Needs siphon-sip 1.15.4 or later (`inline_dispatch::run_coroutine_inline`,
-# `blocking::awaitable` completing on fixed threads).
+# Needs a siphon-sip with `ScriptHandle::start_coroutine` (direct dispatch of
+# extension-built coroutines) and `blocking::awaitable` completing on fixed
+# threads.
 siphon-sip = { git = "https://github.com/siphon-project/siphon-sip", branch = "main" }
 # pyo3 must track siphon-sip's pin (currently 0.29): both link the `python`
 # native library, and Cargo refuses two versions of a `links` crate in one graph.

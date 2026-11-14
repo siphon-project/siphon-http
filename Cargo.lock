@@ -522,6 +522,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-foundation"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1967,6 +1977,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
+name = "openssl-probe"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
+
+[[package]]
 name = "p256"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2484,9 +2500,9 @@ dependencies = [
 
 [[package]]
 name = "rasn"
-version = "0.29.0"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c442ad572d02886fe3a24f770763cb39afb9b3dfe16e05fcdf133b3895e4a24"
+checksum = "8099261c639cababe4b27ab20fb3f9c7cef5e014a12bc63a0fc09a1b90d7751b"
 dependencies = [
  "bitvec",
  "bytes",
@@ -2506,9 +2522,9 @@ dependencies = [
 
 [[package]]
 name = "rasn-derive"
-version = "0.29.0"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "261556388c573dde262717e06ad2c9a9ed78405418f16f2789a0dd8004793fba"
+checksum = "ffcc5d3631747eae0d97d3444c479135c037de13f0701a7ea60732a25eb7ac97"
 dependencies = [
  "proc-macro2",
  "rasn-derive-impl",
@@ -2517,9 +2533,9 @@ dependencies = [
 
 [[package]]
 name = "rasn-derive-impl"
-version = "0.29.0"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e17b9360b511cde533e75baa711dc652f6f613457afe02a66c748ccd6c31ef7"
+checksum = "f55d80a38e4e6a8e435cf61e1144f62219fb7ea3c5bd682e216cb4c32c363114"
 dependencies = [
  "either",
  "itertools 0.13.0",
@@ -2562,15 +2578,21 @@ dependencies = [
  "combine",
  "futures-util",
  "itoa",
+ "log",
  "num-bigint",
  "percent-encoding",
  "pin-project-lite",
+ "rand 0.10.2",
+ "rustls",
+ "rustls-native-certs",
  "ryu",
  "sha1_smol",
  "socket2",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "url",
+ "webpki-roots",
  "xxhash-rust",
 ]
 
@@ -2743,6 +2765,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls-native-certs"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a073f5dc7469f984c52ad2752b63b0807745133b6de880b7b64c1ac4c48aec4"
+dependencies = [
+ "openssl-probe",
+ "rustls-pki-types",
+ "schannel",
+ "security-framework",
+]
+
+[[package]]
 name = "rustls-pki-types"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2786,6 +2820,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "schannel"
+version = "0.1.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cb23c424d8ee841bb4d813677ca237e2a610067d594fec130f87d6093495ab5"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2803,6 +2846,29 @@ dependencies = [
  "hybrid-array",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "security-framework"
+version = "3.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
+dependencies = [
+ "bitflags",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "libc",
+ "security-framework-sys",
+]
+
+[[package]]
+name = "security-framework-sys"
+version = "2.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
 ]
 
 [[package]]
@@ -3017,19 +3083,20 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.15.3"
+version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47548d5f9ca30603d0a7014a3e3f64698e9c3fa274b863ee01e5d56e0ee91fe9"
+checksum = "d8a2f9919be703a411d910ee66e83052a5d9b84f3af98d17e9ad15a033315aa4"
 dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+ "zeroize",
 ]
 
 [[package]]
 name = "siphon-sip"
-version = "1.15.4"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#446f5292f0daf173af7bfdbf1445cba362f05821"
+version = "1.15.14"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#5ca1c1d307a8c9e6189b48e047a83d82324eec11"
 dependencies = [
  "aes",
  "arc-swap",
@@ -3238,7 +3305,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a13f3d0daba03132c0aa9767f98351b3488edc2c100cda2d2ec2b04f3d8d3c8b"
 dependencies = [
  "bitflags",
- "core-foundation",
+ "core-foundation 0.9.4",
  "system-configuration-sys",
 ]
 
@@ -3277,7 +3344,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",

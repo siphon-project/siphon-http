@@ -18,6 +18,8 @@ use axum::Router;
 use http_body_util::BodyExt;
 use pyo3::prelude::*;
 use siphon::script::async_pool::AsyncPool;
+use siphon::script::engine::ScriptEngine;
+use siphon::script::handle::ScriptHandle;
 use siphon::script::py_executor::{ExecutorConfig, PyExecutor};
 use tower::ServiceExt;
 
@@ -80,6 +82,51 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     runtime
 }
 
+/// A handle onto a script engine of its own, as a siphon binary hands one to
+/// the addon: what routes with an `async def` stage start their coroutines
+/// through.
+fn script_handle() -> &'static ScriptHandle {
+    static HANDLE: OnceLock<(ScriptEngine, ScriptHandle)> = OnceLock::new();
+    let runtime = runtime();
+    &HANDLE
+        .get_or_init(|| {
+            // The engine sets up `_siphon_registry`; a test standing in a fake
+            // one must not overlap.
+            let _registry = registry_swap();
+            let path = std::env::temp_dir().join(format!(
+                "siphon-http-dispatch-tests-{}.py",
+                std::process::id()
+            ));
+            std::fs::write(&path, "# no handlers: the tests build their routes\n")
+                .expect("the script file is written");
+            let engine = ScriptEngine::new(&siphon::config::ScriptConfig {
+                path: path.to_str().expect("a UTF-8 path").to_owned(),
+                reload: siphon::config::ReloadMode::Sighup,
+                async_pool_size: None,
+                sync_pool_size: None,
+                sync_pool_max: None,
+                handler_stall_abort_secs: 30,
+                process_stall_abort_secs: 30,
+                handler_timeout_secs: None,
+                executor_queue_capacity: 8192,
+                include_paths: Vec::new(),
+            })
+            .expect("the script engine starts");
+            let handle = ScriptHandle::for_engine(&engine, runtime.handle().clone());
+            (engine, handle)
+        })
+        .1
+}
+
+/// Held while `_siphon_registry` may be a test's stand-in, and while the
+/// script engine is built. Take it before attaching.
+pub(crate) fn registry_swap() -> MutexGuard<'static, ()> {
+    static REGISTRY: Mutex<()> = Mutex::new(());
+    REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The tests that count attaches must not overlap.
 pub(crate) fn serial() -> MutexGuard<'static, ()> {
     static SERIAL: Mutex<()> = Mutex::new(());
@@ -92,6 +139,13 @@ pub(crate) fn serial() -> MutexGuard<'static, ()> {
 #[pyfunction]
 fn on_async_worker() -> bool {
     probe::is_async_worker()
+}
+
+/// A siphon awaitable that completes at once with `value`: what a script
+/// awaits when it calls siphon's own async APIs.
+#[pyfunction]
+fn ready(py: Python<'_>, value: i64) -> PyResult<Bound<'_, PyAny>> {
+    siphon::script::blocking::awaitable(py, async move { Ok(value) })
 }
 
 /// The name of the calling thread, for scripts to report.
@@ -174,6 +228,19 @@ async def slow(req):
     return Response(status=200, body=b"slow")
 
 
+async def awaits_siphon(req):
+    before = thread_name()
+    value = await ready(7)
+    return Response(status=200, body=f"{value}|{before}|{thread_name()}")
+
+
+async def middleware_awaits_siphon(req):
+    await ready(1)
+    if req.header("x-block"):
+        return Response(status=403, body=thread_name())
+    return None
+
+
 def naps(req):
     time.sleep(0.03)
     return Response(status=200, body=b"napped")
@@ -241,6 +308,9 @@ fn script(py: Python<'_>) -> Bound<'_, PyModule> {
             module
                 .add_function(wrap_pyfunction!(thread_name, &module).unwrap())
                 .unwrap();
+            module
+                .add_function(wrap_pyfunction!(ready, &module).unwrap())
+                .unwrap();
             let code = std::ffi::CString::new(SCRIPT).unwrap();
             py.run(code.as_c_str(), Some(&module.dict()), None)
                 .expect("the test script runs");
@@ -295,7 +365,7 @@ fn untimed_router(config: &HttpConfig, middlewares: &[&str], handlers: &[&str]) 
         let middlewares = middlewares.iter().map(|name| stage(py, name)).collect();
         (routes, Arc::new(middlewares))
     });
-    build_router(routes, middlewares, config)
+    build_router(routes, middlewares, config, script_handle())
         .expect("the router builds")
         .0
 }
@@ -471,8 +541,12 @@ fn a_sync_chain_runs_off_the_tokio_workers_in_one_attach() {
     assert_eq!(probe::on_async_workers(), 0);
 }
 
+/// A route with an `async def` stage is started through siphon's
+/// `ScriptHandle::start_coroutine`: this crate does not attach for it at all,
+/// siphon does, in its executor jobs, and nothing runs on a tokio worker
+/// (`no_python_runs_on_a_tokio_worker` watches every Python frame).
 #[test]
-fn an_async_handler_runs_on_the_asyncio_pool_not_a_tokio_worker() {
+fn an_async_route_is_started_by_siphon_not_on_a_tokio_worker() {
     let _serial = serial();
     let router = router(
         &["passes", "passes_async", "passes"],
@@ -491,8 +565,8 @@ fn an_async_handler_runs_on_the_asyncio_pool_not_a_tokio_worker() {
     );
     assert_eq!(
         probe::all() - before,
-        1,
-        "the job hands the async stages over within its one attach"
+        0,
+        "an async route attaches only inside siphon's executor jobs"
     );
     assert_eq!(probe::on_async_workers(), 0);
 }
@@ -813,6 +887,7 @@ fn every_attach_goes_through_the_counted_helper() {
 /// options, which is where the runtime reads it from.
 #[test]
 fn the_decorators_register_the_function_they_wrap() {
+    let _registry = registry_swap();
     Python::attach(|py| {
         let namespace = crate::namespace(HttpConfig::default())(py).expect("the namespace builds");
         let globals = pyo3::types::PyDict::new(py);
@@ -822,15 +897,21 @@ fn the_decorators_register_the_function_they_wrap() {
 registry = types.ModuleType('_siphon_registry')
 registry.calls = []
 registry.register = lambda *args: registry.calls.append(args)
+previous = sys.modules.get('_siphon_registry')
 sys.modules['_siphon_registry'] = registry
+try:
+    @http.route('/a')
+    def route_handler(req):
+        return None
 
-@http.route('/a')
-def route_handler(req):
-    return None
-
-@http.middleware
-async def guard(req):
-    return None
+    @http.middleware
+    async def guard(req):
+        return None
+finally:
+    if previous is None:
+        del sys.modules['_siphon_registry']
+    else:
+        sys.modules['_siphon_registry'] = previous
 
 registered = [(call[0], call[4]['handler'] is call[2], call[3]) for call in registry.calls]
 ",
@@ -1036,7 +1117,6 @@ fn a_sync_handler_is_timed_from_head_to_body_done() {
     assert_eq!(handler.len(), 1, "{handler:?}");
     assert_eq!(wait.len(), 1, "{wait:?}");
     assert_eq!(request.len(), 1, "{request:?}");
-    assert!(recorded.of(Metric::AsyncHandoffWait).is_empty());
     assert!(
         handler[0].1 >= 0.03,
         "the handler sleeps 30 ms: {handler:?}"
@@ -1056,10 +1136,10 @@ fn a_sync_handler_is_timed_from_head_to_body_done() {
     assert_eq!(recorded.in_flight(), 0.0);
 }
 
-/// An `async def` handler that suspends: the hop onto the asyncio pool is
-/// observed on its own, and the handler's run covers its await.
+/// An `async def` handler that suspends: its run, the await included, is the
+/// handler's time.
 #[test]
-fn a_suspending_handler_has_its_asyncio_handoff_timed() {
+fn a_suspending_handler_is_timed_across_its_await() {
     let _serial = serial();
     let (router, recorded) = timed_router(&HttpConfig::default(), &["naps_async"]);
     assert_eq!(
@@ -1067,15 +1147,14 @@ fn a_suspending_handler_has_its_asyncio_handoff_timed() {
         (200, "napped async".to_string())
     );
 
-    let handoff = recorded.of(Metric::AsyncHandoffWait);
     let handler = recorded.of(Metric::Handler);
-    assert_eq!(handoff.len(), 1, "{handoff:?}");
+    let wait = recorded.of(Metric::HandlerWait);
     assert_eq!(handler.len(), 1, "{handler:?}");
+    assert_eq!(wait.len(), 1, "{wait:?}");
     assert!(
         handler[0].1 >= 0.02,
         "the handler awaits 20 ms: {handler:?}"
     );
-    assert!(handoff[0].1 <= handler[0].1, "{handoff:?} {handler:?}");
     assert_eq!(recorded.in_flight(), 0.0);
 }
 
@@ -1186,4 +1265,58 @@ fn headers_invalid_dict_entries_return_500() {
     for path in ["/invalid_header_value", "/invalid_header_key"] {
         assert_eq!(get(&router, path), (500, "bad response\n".into()));
     }
+}
+
+// ── Direct dispatch ──────────────────────────────────────────────────────
+
+/// An `async def` handler that awaits only siphon's awaitables is resumed by
+/// the executor: no asyncio driver thread runs any of it.
+#[test]
+fn a_handler_awaiting_only_siphon_awaitables_never_reaches_the_asyncio_driver() {
+    let _serial = serial();
+    let router = router(&[], &["awaits_siphon"]);
+    let (status, body) = get(&router, "/awaits_siphon");
+    assert_eq!(status, 200, "{body}");
+    let parts: Vec<&str> = body.split('|').collect();
+    assert_eq!(parts[0], "7", "{body}");
+    assert!(
+        !parts[1].starts_with("siphon-asyncio") && !parts[2].starts_with("siphon-asyncio"),
+        "the handler ran on an asyncio driver: {body}"
+    );
+}
+
+/// The same for an `async def` middleware in front of a handler, whether it
+/// answers or lets the request through.
+#[test]
+fn a_middleware_awaiting_only_siphon_awaitables_never_reaches_the_asyncio_driver() {
+    let _serial = serial();
+    let router = router(&["middleware_awaits_siphon"], &["awaits_siphon"]);
+    let (status, body) = get_with(
+        &router,
+        "/awaits_siphon",
+        vec![("x-block", "1".to_string())],
+    );
+    assert_eq!(status, 403, "{body}");
+    assert!(!body.starts_with("siphon-asyncio"), "{body}");
+    let (status, body) = get(&router, "/awaits_siphon");
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains("siphon-asyncio"), "{body}");
+}
+
+/// siphon sends a coroutine that used asyncio straight to its asyncio driver
+/// from then on, by its code object. A route whose handler uses asyncio must
+/// not take the other routes with it.
+#[test]
+fn a_route_that_uses_asyncio_leaves_the_other_routes_direct() {
+    let _serial = serial();
+    let router = router(&[], &["naps_async", "awaits_siphon"]);
+    for _ in 0..3 {
+        assert_eq!(get(&router, "/naps_async").0, 200);
+    }
+    let (status, body) = get(&router, "/awaits_siphon");
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        !body.contains("siphon-asyncio"),
+        "an asyncio route moved this one to the driver: {body}"
+    );
 }

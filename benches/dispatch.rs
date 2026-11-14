@@ -197,7 +197,7 @@ fn per_stage(functions: &Functions, middlewares: usize) -> Router {
                         .bind(py)
                         .extract::<PyRef<'_, siphon_http::Response>>()
                     {
-                        Ok(response) => siphon_http::__bench::response(&response),
+                        Ok(response) => siphon_http::__bench::response(py, &response),
                         Err(_) => internal_error(),
                     }
                 })

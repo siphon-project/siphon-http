@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   attached to Python. About 1 µs per request (`single_job_timed` in
   `benches/dispatch.rs`).
 
+### Fixed
+
+- `Response.headers` reuses a dict created on its first read. In-place mutations
+  now affect the HTTP response; non-string keys or values produce a logged 500.
+  From Rust, `Response::headers` is no longer a public field; read them with
+  `Response::header_pairs(py)`.
+
 ### Security
 
 - **Cargo.lock refresh**: hickory-net, hickory-proto and hickory-resolver

@@ -81,7 +81,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 }
 
 /// The tests that count attaches must not overlap.
-fn serial() -> MutexGuard<'static, ()> {
+pub(crate) fn serial() -> MutexGuard<'static, ()> {
     static SERIAL: Mutex<()> = Mutex::new(());
     SERIAL
         .lock()
@@ -125,6 +125,31 @@ async def blocks_async(req):
     if req.header("x-block"):
         return Response(status=403, body=b"blocked async")
     return None
+
+
+def mutated_headers(req):
+    response = Response(headers={"x-remove": "old", "x-change": "old"})
+    response.headers["x-change"] = "new"
+    del response.headers["x-remove"]
+    response.headers.update({"x-added": "yes"})
+    return response
+
+
+async def mutated_headers_async(req):
+    await asyncio.sleep(0)
+    return mutated_headers(req)
+
+
+def invalid_header_value(req):
+    response = Response()
+    response.headers["x-invalid"] = 42
+    return response
+
+
+def invalid_header_key(req):
+    response = Response()
+    response.headers[42] = "invalid"
+    return response
 
 
 def returns_junk(req):
@@ -1121,4 +1146,44 @@ fn an_abandoned_response_body_is_no_longer_in_flight() {
     });
     assert_eq!(recorded.of(Metric::Request).len(), 1);
     assert_eq!(recorded.in_flight(), 0.0);
+}
+
+fn assert_mutated_headers(handler: &str) {
+    let _serial = serial();
+    let rt = runtime();
+    let router = router(&[], &[handler]);
+    let path = format!("/{handler}");
+    let response = rt.block_on(async move {
+        tokio::spawn(async move {
+            router
+                .oneshot(HttpRequest::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        })
+        .await
+        .unwrap()
+    });
+    assert_eq!(response.status().as_u16(), 200, "{handler}");
+    assert_eq!(response.headers().get("x-change").unwrap(), "new");
+    assert_eq!(response.headers().get("x-added").unwrap(), "yes");
+    assert!(!response.headers().contains_key("x-remove"));
+}
+
+#[test]
+fn headers_mutations_reach_http_response() {
+    assert_mutated_headers("mutated_headers");
+}
+
+#[test]
+fn headers_async_mutations_reach_http_response() {
+    assert_mutated_headers("mutated_headers_async");
+}
+
+#[test]
+fn headers_invalid_dict_entries_return_500() {
+    let _serial = serial();
+    let router = router(&[], &["invalid_header_value", "invalid_header_key"]);
+    for path in ["/invalid_header_value", "/invalid_header_key"] {
+        assert_eq!(get(&router, path), (500, "bad response\n".into()));
+    }
 }

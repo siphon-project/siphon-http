@@ -202,6 +202,15 @@ http.Response(status=200, headers={"Content-Type": "application/json"}, body=b"{
 | `headers` | `None` | Response headers as a dict. |
 | `body` | `None` | `bytes` or `str` (UTF-8 encoded). |
 
+`resp.headers` is a mutable `dict[str, str]`, created on its first read and
+returned as the same dict on subsequent reads. Lookups are case-sensitive, as
+with any Python dict. In-place changes (`resp.headers["x"] = "y"`, `del`, and
+`update`) affect the response sent by a handler. Assigning `resp.headers = {...}`
+replaces the headers; previously returned dicts no longer affect the response.
+Construction and assignment require string keys and values. If in-place mutation
+leaves a non-string key or value, returning that response produces HTTP 500 and
+logs the invalid header.
+
 A `Response` also exposes a `.body` property and `.raise_for_status()` — most
 useful on the responses you get *back* from an [`http.Client`](#httpclient) call.
 

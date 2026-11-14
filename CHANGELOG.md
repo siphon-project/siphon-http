@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.0] — 2026-11-14
+
 ### Added
 
 - Request timing on siphon's metrics registry, labelled by listener, method

@@ -6,6 +6,8 @@
 //!   request; the tokio worker never attaches. `single_job_async_inline` is
 //!   an `async def` handler that never awaits (run inline in the job), and
 //!   `single_job_async` one that awaits (run on the asyncio pool).
+//!   `single_job_timed` is `single_job` behind the request timing layer,
+//!   recording on siphon's metrics registry.
 //! - `per_stage` reproduces the dispatcher this replaced: every middleware
 //!   and the handler was its own executor job, and the tokio worker attached
 //!   to build the request object, to hand each stage its argument and to read
@@ -242,6 +244,16 @@ fn bench(c: &mut Criterion) {
             (
                 "single_job",
                 single_job(&functions, middlewares, &functions.handler, false),
+            ),
+            (
+                "single_job_timed",
+                siphon_http::__bench::timed(single_job(
+                    &functions,
+                    middlewares,
+                    &functions.handler,
+                    false,
+                ))
+                .unwrap(),
             ),
             (
                 "single_job_async_inline",

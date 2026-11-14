@@ -23,6 +23,7 @@ use tower::ServiceExt;
 
 use crate::dispatch::{probe, Stage};
 use crate::runtime::{build_router, RouteOptions};
+use crate::timing::{timed, Labels, Metric, Recorder};
 use crate::HttpConfig;
 
 const WORKERS: usize = 4;
@@ -101,6 +102,7 @@ fn thread_name() -> String {
 
 const SCRIPT: &str = r#"
 import asyncio
+import time
 
 
 def passes(req):
@@ -145,6 +147,16 @@ async def where_async(req):
 async def slow(req):
     await asyncio.sleep(0.4)
     return Response(status=200, body=b"slow")
+
+
+def naps(req):
+    time.sleep(0.03)
+    return Response(status=200, body=b"napped")
+
+
+async def naps_async(req):
+    await asyncio.sleep(0.02)
+    return Response(status=200, body=b"napped async")
 
 
 async def never_awaits(req):
@@ -230,8 +242,17 @@ fn router(middlewares: &[&str], handlers: &[&str]) -> Router {
     router_with(&HttpConfig::default(), middlewares, handlers)
 }
 
-/// [`router`] built with `config`.
+/// [`router`] built with `config`, timed the way `spawn_with` times it, into
+/// a recorder nobody reads.
 fn router_with(config: &HttpConfig, middlewares: &[&str], handlers: &[&str]) -> Router {
+    timed(
+        untimed_router(config, middlewares, handlers),
+        Arc::new(Recorded::default()),
+    )
+}
+
+/// [`router`] built with `config`, without the timing layer.
+fn untimed_router(config: &HttpConfig, middlewares: &[&str], handlers: &[&str]) -> Router {
     let (routes, middlewares) = Python::attach(|py| {
         let routes = handlers
             .iter()
@@ -915,4 +936,189 @@ async fn raw(router: Router, path: &str) -> (u16, Option<String>, String) {
 fn get_status(router: &Router, path: &str) -> (u16, Option<String>) {
     let (status, retry_after, _) = runtime().block_on(raw(router.clone(), path));
     (status, retry_after)
+}
+
+// ── Request timing ───────────────────────────────────────────────────────
+
+/// One observation: metric, listener, method, status class, seconds.
+type Observation = (Metric, String, &'static str, &'static str, f64);
+
+/// A [`Recorder`] that keeps what it is given.
+#[derive(Default)]
+struct Recorded {
+    observations: Mutex<Vec<Observation>>,
+    in_flight: Mutex<f64>,
+    in_flight_peak: Mutex<f64>,
+}
+
+impl Recorder for Recorded {
+    fn observe(&self, metric: Metric, labels: &Labels<'_>, seconds: f64) {
+        self.observations.lock().unwrap().push((
+            metric,
+            labels.listener.to_string(),
+            labels.method,
+            labels.status_class,
+            seconds,
+        ));
+    }
+
+    fn in_flight(&self, _listener: &str, delta: f64) {
+        let mut now = self.in_flight.lock().unwrap();
+        *now += delta;
+        let mut peak = self.in_flight_peak.lock().unwrap();
+        *peak = peak.max(*now);
+    }
+}
+
+impl Recorded {
+    /// The seconds observed for `metric`, with their status class.
+    fn of(&self, metric: Metric) -> Vec<(&'static str, f64)> {
+        self.observations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|observation| observation.0 == metric)
+            .map(|observation| (observation.3, observation.4))
+            .collect()
+    }
+
+    fn in_flight(&self) -> f64 {
+        *self.in_flight.lock().unwrap()
+    }
+}
+
+fn timed_router(config: &HttpConfig, handlers: &[&str]) -> (Router, Arc<Recorded>) {
+    let recorded = Arc::new(Recorded::default());
+    let router = timed(
+        untimed_router(config, &[], handlers),
+        Arc::clone(&recorded) as Arc<dyn Recorder>,
+    );
+    (router, recorded)
+}
+
+/// A sync handler: the wait before it, its run and the whole request are
+/// each observed once, with bounded labels, and the request is no longer in
+/// flight once its body is read.
+#[test]
+fn a_sync_handler_is_timed_from_head_to_body_done() {
+    let _serial = serial();
+    let (router, recorded) = timed_router(&HttpConfig::default(), &["naps"]);
+    assert_eq!(get(&router, "/naps"), (200, "napped".to_string()));
+
+    let handler = recorded.of(Metric::Handler);
+    let wait = recorded.of(Metric::HandlerWait);
+    let request = recorded.of(Metric::Request);
+    assert_eq!(handler.len(), 1, "{handler:?}");
+    assert_eq!(wait.len(), 1, "{wait:?}");
+    assert_eq!(request.len(), 1, "{request:?}");
+    assert!(recorded.of(Metric::AsyncHandoffWait).is_empty());
+    assert!(
+        handler[0].1 >= 0.03,
+        "the handler sleeps 30 ms: {handler:?}"
+    );
+    assert!(
+        request[0].1 >= handler[0].1 + wait[0].1,
+        "the request spans the wait and the handler: {request:?} {wait:?} {handler:?}"
+    );
+    let observations = recorded.observations.lock().unwrap();
+    for observation in observations.iter() {
+        assert_eq!(
+            (observation.1.as_str(), observation.2, observation.3),
+            ("unknown", "GET", "2xx")
+        );
+    }
+    assert_eq!(*recorded.in_flight_peak.lock().unwrap(), 1.0);
+    assert_eq!(recorded.in_flight(), 0.0);
+}
+
+/// An `async def` handler that suspends: the hop onto the asyncio pool is
+/// observed on its own, and the handler's run covers its await.
+#[test]
+fn a_suspending_handler_has_its_asyncio_handoff_timed() {
+    let _serial = serial();
+    let (router, recorded) = timed_router(&HttpConfig::default(), &["naps_async"]);
+    assert_eq!(
+        get(&router, "/naps_async"),
+        (200, "napped async".to_string())
+    );
+
+    let handoff = recorded.of(Metric::AsyncHandoffWait);
+    let handler = recorded.of(Metric::Handler);
+    assert_eq!(handoff.len(), 1, "{handoff:?}");
+    assert_eq!(handler.len(), 1, "{handler:?}");
+    assert!(
+        handler[0].1 >= 0.02,
+        "the handler awaits 20 ms: {handler:?}"
+    );
+    assert!(handoff[0].1 <= handler[0].1, "{handoff:?} {handler:?}");
+    assert_eq!(recorded.in_flight(), 0.0);
+}
+
+/// An answer no handler gave is timed as a request but not as a handler run:
+/// the 404 of an unknown path, the 503 of a route limit and the 504 of the
+/// request timeout.
+#[test]
+fn answers_without_a_handler_are_timed_as_requests_only() {
+    let _serial = serial();
+    let (router, recorded) = timed_router(
+        &config("limits:\n  - path: /slow\n    max_inflight: 1\n    retry_after_seconds: 3\n"),
+        &["slow"],
+    );
+    let statuses = runtime().block_on(async {
+        let first = tokio::spawn({
+            let router = router.clone();
+            async move { raw(router, "/slow").await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let refused = raw(router.clone(), "/slow").await;
+        let unknown = raw(router.clone(), "/nowhere").await;
+        (first.await.unwrap().0, refused.0, unknown.0)
+    });
+    assert_eq!(statuses, (200, 503, 404));
+    let mut classes: Vec<&str> = recorded
+        .of(Metric::Request)
+        .iter()
+        .map(|observation| observation.0)
+        .collect();
+    classes.sort_unstable();
+    assert_eq!(classes, ["2xx", "4xx", "5xx"]);
+    let handler = recorded.of(Metric::Handler);
+    assert_eq!(
+        handler.len(),
+        1,
+        "only the admitted request ran: {handler:?}"
+    );
+    assert_eq!(handler[0].0, "2xx");
+    assert_eq!(recorded.of(Metric::HandlerWait).len(), 1);
+
+    let (timing_out, recorded) = timed_router(
+        &config("servers:\n  - listen: 127.0.0.1:0\n    request_timeout_ms: 100\n"),
+        &["slow"],
+    );
+    assert_eq!(get_status(&timing_out, "/slow").0, 504);
+    assert_eq!(recorded.of(Metric::Request).len(), 1);
+    assert_eq!(recorded.of(Metric::Request)[0].0, "5xx");
+    assert!(recorded.of(Metric::Handler).is_empty());
+    assert_eq!(recorded.in_flight(), 0.0);
+}
+
+/// A response whose body is never read still leaves the in-flight count.
+#[test]
+fn an_abandoned_response_body_is_no_longer_in_flight() {
+    let _serial = serial();
+    let (router, recorded) = timed_router(&HttpConfig::default(), &["naps"]);
+    runtime().block_on(async {
+        tokio::spawn(async move {
+            let response = router
+                .oneshot(HttpRequest::get("/naps").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            drop(response);
+        })
+        .await
+        .unwrap();
+    });
+    assert_eq!(recorded.of(Metric::Request).len(), 1);
+    assert_eq!(recorded.in_flight(), 0.0);
 }

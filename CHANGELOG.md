@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Request timing on siphon's metrics registry, labelled by listener, method
+  and status class: `http_server_request_seconds`,
+  `http_server_handler_wait_seconds`, `http_server_handler_seconds`,
+  `http_server_async_handoff_wait_seconds` and the
+  `http_server_requests_in_flight` gauge. Every answer is timed, refusals
+  and timeouts included; metric updates run on the tokio task, never while
+  attached to Python. About 1 µs per request (`single_job_timed` in
+  `benches/dispatch.rs`).
+
 ## [2.3.0] — 2026-11-13
 
 ### Added

@@ -213,6 +213,10 @@ pub fn spawn_with(cfg: HttpConfig, script: ScriptHandle, admission: Option<Arc<d
     if let Some(admission) = admission {
         router = guarded(router, admission);
     }
+    // Last, so it is the outermost layer and times the guard's refusals too.
+    if let Some(recorder) = crate::timing::siphon_recorder() {
+        router = crate::timing::timed(router, recorder);
+    }
 
     // A route restricted to a listener no `servers[]` entry has would be
     // served nowhere. That is a typo in the script or the config, and fatal

@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   attached to Python. About 1 µs per request (`single_job_timed` in
   `benches/dispatch.rs`).
 
+### Security
+
+- **Cargo.lock refresh**: hickory-net, hickory-proto and hickory-resolver
+  0.26.3 (pulled in by `siphon-sip`) for RUSTSEC-2026-0487 to -0491,
+  -0506 to -0509, -0513 to -0520 and -0539 to -0541: DNSSEC validation
+  bypasses, resolver retry and memory amplification, and parser panics.
+
 ## [2.3.0] — 2026-11-13
 
 ### Added

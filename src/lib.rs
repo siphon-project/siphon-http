@@ -121,7 +121,7 @@ pub mod __bench {
     }
 
     /// The HTTP response for a handler's `Response`.
-    pub fn response(response: &crate::Response) -> axum::response::Response {
-        crate::dispatch::build_axum_response(response)
+    pub fn response(py: Python<'_>, response: &crate::Response) -> axum::response::Response {
+        crate::dispatch::build_axum_response(py, response)
     }
 }

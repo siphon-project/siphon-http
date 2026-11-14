@@ -130,21 +130,15 @@ pub(crate) struct ScriptReply {
     body: Vec<u8>,
 }
 
-impl From<&PyResponse> for ScriptReply {
-    fn from(response: &PyResponse) -> Self {
-        Self {
-            status: response.status,
-            headers: response
-                .headers
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect(),
-            body: response.body_bytes.clone(),
-        }
-    }
-}
-
 impl ScriptReply {
+    fn from(py: Python<'_>, response: &PyResponse) -> PyResult<Self> {
+        Ok(Self {
+            status: response.status,
+            headers: response.header_pairs(py)?,
+            body: response.body_bytes.clone(),
+        })
+    }
+
     fn into_response(self) -> AxumResponse {
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let mut builder = AxumResponse::builder().status(status);
@@ -389,7 +383,7 @@ impl ResponseSink {
 /// here: it means "continue".
 fn stage_response(value: &Bound<'_, PyAny>, is_middleware: bool) -> Reply {
     match value.extract::<PyRef<'_, PyResponse>>() {
-        Ok(response) => Reply::Script(ScriptReply::from(&*response)),
+        Ok(response) => script_reply(value.py(), &response),
         Err(error) if is_middleware => {
             tracing::warn!(
                 target: "siphon_http",
@@ -419,8 +413,18 @@ fn stage_raised(error: &PyErr, is_middleware: bool) -> Reply {
 }
 
 /// The HTTP response for a script's `Response`.
-pub(crate) fn build_axum_response(response: &PyResponse) -> AxumResponse {
-    ScriptReply::from(response).into_response()
+pub(crate) fn build_axum_response(py: Python<'_>, response: &PyResponse) -> AxumResponse {
+    script_reply(py, response).into_response()
+}
+
+fn script_reply(py: Python<'_>, response: &PyResponse) -> Reply {
+    match ScriptReply::from(py, response) {
+        Ok(reply) => Reply::Script(reply),
+        Err(error) => {
+            tracing::error!(target: "siphon_http", %error, "invalid Response headers");
+            Reply::error(StatusCode::INTERNAL_SERVER_ERROR, "bad response")
+        }
+    }
 }
 
 pub(crate) fn error_response(status: StatusCode, message: &str) -> AxumResponse {

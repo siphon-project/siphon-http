@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `Response.headers` reuses a dict created on its first read. In-place mutations
+  now affect the HTTP response; non-string keys or values produce a logged 500.
+  From Rust, `Response::headers` is no longer a public field; read them with
+  `Response::header_pairs(py)`.
+
 ## [2.3.0] — 2026-11-13
 
 ### Added

@@ -264,11 +264,11 @@ impl Client {
                 .request(method, path.as_str(), &headers, body)
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            Ok(PyResponse {
-                status: reply.status,
-                headers: reply.headers.into_iter().collect(),
-                body_bytes: reply.body,
-            })
+            Ok(PyResponse::from_parts(
+                reply.status,
+                reply.headers.into_iter().collect(),
+                reply.body,
+            ))
         })
     }
 }

@@ -1187,3 +1187,263 @@ fn headers_invalid_dict_entries_return_500() {
         assert_eq!(get(&router, path), (500, "bad response\n".into()));
     }
 }
+
+// ── Native routes ─────────────────────────────────────────────────────────
+
+/// A router with `native` routes beside the dispatch test script's
+/// `handlers`, each served as `GET /<handler>`.
+fn native_router(
+    config: &HttpConfig,
+    native: crate::native::NativeRoutes,
+    handlers: &[&str],
+) -> Router {
+    let routes = Python::attach(|py| {
+        handlers
+            .iter()
+            .map(|name| {
+                (
+                    RouteOptions {
+                        path: format!("/{name}"),
+                        methods: vec![Method::GET],
+                        listeners: None,
+                    },
+                    stage(py, name),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    runtime();
+    crate::runtime::build_router_with(routes, Arc::new(Vec::new()), config, &native)
+        .expect("the router builds")
+        .0
+}
+
+fn echo_routes() -> crate::native::NativeRoutes {
+    crate::native::NativeRoutes::new()
+        .route(
+            "/native/{name}",
+            &["get", "PUT"],
+            None,
+            |request| async move {
+                crate::native::NativeResponse::new(200)
+                    .header("x-name", request.path_param("name").unwrap_or(""))
+                    .body(format!(
+                        "{} {} {}",
+                        request.method,
+                        request.path_param("name").unwrap_or(""),
+                        request.body_bytes().len()
+                    ))
+            },
+        )
+        .expect("a valid route")
+}
+
+#[test]
+fn a_native_route_answers_without_the_interpreter() {
+    let _serial = serial();
+    let router = native_router(&HttpConfig::default(), echo_routes(), &[]);
+    let before = probe::all();
+    let answers: Vec<(u16, String)> = (0..50).map(|_| get(&router, "/native/abc")).collect();
+    assert!(
+        answers
+            .iter()
+            .all(|answer| *answer == (200, "GET abc 0".to_string())),
+        "{answers:?}"
+    );
+    assert_eq!(
+        probe::all(),
+        before,
+        "a native route attached to the interpreter"
+    );
+}
+
+#[test]
+fn a_native_route_and_a_scripted_route_share_the_router() {
+    let _serial = serial();
+    let router = native_router(&HttpConfig::default(), echo_routes(), &["where"]);
+    assert_eq!(get(&router, "/native/x"), (200, "GET x 0".to_string()));
+    assert_eq!(get(&router, "/where"), (200, "worker=False".to_string()));
+    assert_eq!(get(&router, "/nowhere").0, 404);
+    // A method the native route does not serve.
+    let status = runtime().block_on(async {
+        let response = router
+            .clone()
+            .oneshot(
+                HttpRequest::delete("/native/x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        response.status().as_u16()
+    });
+    assert_eq!(status, 405);
+}
+
+#[test]
+fn a_native_route_takes_the_place_of_a_scripted_route_on_the_same_method() {
+    let _serial = serial();
+    let native = crate::native::NativeRoutes::new()
+        .route("/where", &["GET"], None, |_| async {
+            crate::native::NativeResponse::new(203).body("native")
+        })
+        .unwrap();
+    let router = native_router(&HttpConfig::default(), native, &["where"]);
+    let before = probe::all();
+    assert_eq!(get(&router, "/where"), (203, "native".to_string()));
+    assert_eq!(probe::all(), before, "the script's handler ran");
+}
+
+#[test]
+fn a_route_limit_applies_to_a_native_route() {
+    let _serial = serial();
+    let native = crate::native::NativeRoutes::new()
+        .route("/held", &["GET"], None, |_| async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            crate::native::NativeResponse::new(200).body("held")
+        })
+        .unwrap();
+    let router = native_router(
+        &config("limits:\n  - path: /held\n    max_inflight: 1\n    retry_after_seconds: 2\n"),
+        native,
+        &[],
+    );
+    let statuses = runtime().block_on(async {
+        let first = tokio::spawn({
+            let router = router.clone();
+            async move { raw(router, "/held").await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let refused = raw(router.clone(), "/held").await;
+        (first.await.unwrap().0, refused.0, refused.1)
+    });
+    assert_eq!(statuses, (200, 503, Some("2".to_string())));
+}
+
+#[test]
+fn a_native_route_with_a_bad_method_or_path_is_refused() {
+    let route = |path: &str, methods: &[&str]| {
+        crate::native::NativeRoutes::new()
+            .route(path, methods, None, |_| async {
+                crate::native::NativeResponse::new(200)
+            })
+            .err()
+    };
+    assert_eq!(
+        route("/a", &["G ET"]),
+        Some(crate::native::NativeRouteError::Method("G ET".into()))
+    );
+    assert_eq!(
+        route("a", &["GET"]),
+        Some(crate::native::NativeRouteError::Path("a".into()))
+    );
+    assert_eq!(
+        route("/a", &[]),
+        Some(crate::native::NativeRouteError::NoMethod("/a".into()))
+    );
+}
+
+/// The process's CPU time (user + system), from `/proc/self/stat`.
+fn process_cpu() -> Duration {
+    let stat = std::fs::read_to_string("/proc/self/stat").expect("procfs");
+    // The fields after the command name, which is in parentheses.
+    let fields: Vec<&str> = stat
+        .rsplit_once(')')
+        .expect("a command name")
+        .1
+        .split_whitespace()
+        .collect();
+    let ticks: u64 = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+    // SAFETY: sysconf has no preconditions.
+    let per_second = unsafe { libc_sysconf_clk_tck() };
+    Duration::from_secs_f64(ticks as f64 / per_second as f64)
+}
+
+extern "C" {
+    fn sysconf(name: i32) -> i64;
+}
+
+unsafe fn libc_sysconf_clk_tck() -> i64 {
+    // _SC_CLK_TCK is 2 on Linux.
+    sysconf(2)
+}
+
+#[pyfunction]
+fn bench_store(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    siphon::script::blocking::awaitable(py, async move { Ok(1u8) })
+}
+
+/// CPU per request of a scripted route against a native one, at the same
+/// concurrency. Opt-in: `cargo test --release --lib -- --ignored
+/// cpu_per_request --nocapture`.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn cpu_per_request_of_scripted_and_native_routes() {
+    let _serial = serial();
+    const REQUESTS: usize = 20_000;
+    const CONCURRENCY: usize = 64;
+    Python::attach(|py| {
+        let module = script(py);
+        module
+            .add_function(wrap_pyfunction!(bench_store, &module).unwrap())
+            .unwrap();
+        py.run(
+            c"
+async def awaits_store(req):
+    await bench_store()
+    return Response(status=200, body=b'ok')
+
+def sync_ok(req):
+    return Response(status=200, body=b'ok')
+",
+            Some(&module.dict()),
+            None,
+        )
+        .unwrap();
+    });
+    let native = crate::native::NativeRoutes::new()
+        .route("/native", &["GET"], None, |_| async {
+            crate::native::NativeResponse::new(200).body("ok")
+        })
+        .unwrap();
+    let router = native_router(&HttpConfig::default(), native, &["awaits_store", "sync_ok"]);
+    for path in [
+        "/awaits_store",
+        "/sync_ok",
+        "/native",
+        "/awaits_store",
+        "/sync_ok",
+        "/native",
+    ] {
+        let router = router.clone();
+        let cpu = process_cpu();
+        let started = Instant::now();
+        let ok = runtime().block_on(async move {
+            let next = Arc::new(AtomicUsize::new(0));
+            let mut tasks = Vec::new();
+            for _ in 0..CONCURRENCY {
+                let (router, next) = (router.clone(), Arc::clone(&next));
+                tasks.push(tokio::spawn(async move {
+                    let mut ok = 0;
+                    while next.fetch_add(1, Ordering::Relaxed) < REQUESTS {
+                        if send(router.clone(), path.to_string(), Vec::new()).await.0 == 200 {
+                            ok += 1;
+                        }
+                    }
+                    ok
+                }));
+            }
+            let mut ok = 0;
+            for task in tasks {
+                ok += task.await.unwrap();
+            }
+            ok
+        });
+        let (cpu, wall) = (process_cpu() - cpu, started.elapsed());
+        println!(
+            "{path:14} {ok} ok  {:7.1} us CPU/request  {:8.0} requests/s",
+            cpu.as_secs_f64() * 1e6 / REQUESTS as f64,
+            REQUESTS as f64 / wall.as_secs_f64()
+        );
+    }
+}

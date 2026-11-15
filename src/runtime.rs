@@ -143,6 +143,21 @@ pub fn spawn(cfg: HttpConfig, script: ScriptHandle) {
 /// before its body is read and before any middleware or handler (see
 /// [`crate::admission`]).
 pub fn spawn_with(cfg: HttpConfig, script: ScriptHandle, admission: Option<Arc<dyn Admission>>) {
+    spawn_with_native(
+        cfg,
+        script,
+        admission,
+        crate::native::NativeRoutes::default(),
+    )
+}
+
+/// [`spawn_with`], also serving `native` routes (see [`crate::native`]).
+pub fn spawn_with_native(
+    cfg: HttpConfig,
+    script: ScriptHandle,
+    admission: Option<Arc<dyn Admission>>,
+    native: crate::native::NativeRoutes,
+) {
     set_named_clients(cfg.clients.clone());
     set_trusted_proxies(
         &cfg.servers
@@ -202,7 +217,7 @@ pub fn spawn_with(cfg: HttpConfig, script: ScriptHandle, admission: Option<Arc<d
     };
 
     let route_count = routes.len();
-    let (mut router, scopes) = match build_router(routes, middlewares, &cfg) {
+    let (mut router, scopes) = match build_router_with(routes, middlewares, &cfg, &native) {
         Ok(built) => built,
         Err(error) => {
             tracing::error!(target: "siphon_http", %error, "http routes could not be built");
@@ -336,7 +351,53 @@ pub(crate) fn build_router(
     middlewares: Arc<Vec<Stage>>,
     cfg: &HttpConfig,
 ) -> PyResult<(Router, Vec<(String, RouteScope)>)> {
+    build_router_with(
+        routes,
+        middlewares,
+        cfg,
+        &crate::native::NativeRoutes::default(),
+    )
+}
+
+/// [`build_router`] with `native` routes. A native route is matched before
+/// any scripted route of its path, so where both serve a method on a
+/// listener the native one answers; that is reported here.
+pub(crate) fn build_router_with(
+    routes: Vec<(RouteOptions, Stage)>,
+    middlewares: Arc<Vec<Stage>>,
+    cfg: &HttpConfig,
+    native: &crate::native::NativeRoutes,
+) -> PyResult<(Router, Vec<(String, RouteScope)>)> {
     let mut by_path: HashMap<String, Vec<RouteEntry>> = HashMap::new();
+    for route in &native.routes {
+        by_path
+            .entry(route.path.clone())
+            .or_default()
+            .push(RouteEntry {
+                scope: RouteScope {
+                    methods: route.methods.clone(),
+                    listeners: route.listeners.clone(),
+                },
+                serve: Serve::Native(Arc::clone(&route.handler)),
+            });
+    }
+    for (options, _) in &routes {
+        let shadowed = native.routes.iter().any(|route| {
+            route.path == options.path
+                && route
+                    .methods
+                    .iter()
+                    .any(|method| options.methods.contains(method))
+                && listeners_overlap(route.listeners.as_deref(), options.listeners.as_deref())
+        });
+        if shadowed {
+            tracing::warn!(
+                target: "siphon_http",
+                path = %options.path,
+                "http.route is served by a native route on the same method and listener; the script's handler is not called"
+            );
+        }
+    }
 
     // One attach, at startup, to lay out each route's stages.
     attach(|py| -> PyResult<()> {
@@ -350,7 +411,7 @@ pub(crate) fn build_router(
                     methods: options.methods,
                     listeners: options.listeners,
                 },
-                route: Arc::new(route),
+                serve: Serve::Script(Arc::new(route)),
             });
         }
         Ok(())
@@ -425,6 +486,14 @@ pub(crate) fn build_router(
     Ok((router, scopes))
 }
 
+/// Whether two `listeners` restrictions (None: every listener) share one.
+fn listeners_overlap(one: Option<&[String]>, other: Option<&[String]>) -> bool {
+    match (one, other) {
+        (Some(one), Some(other)) => one.iter().any(|name| other.contains(name)),
+        _ => true,
+    }
+}
+
 /// What `@http.route(...)` registered for one handler.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RouteOptions {
@@ -495,7 +564,15 @@ impl RouteScope {
 
 struct RouteEntry {
     scope: RouteScope,
-    route: Arc<Route>,
+    serve: Serve,
+}
+
+/// What answers a request a route matched: a script's handler, or a Rust
+/// one (see [`crate::native`]).
+#[derive(Clone)]
+pub(crate) enum Serve {
+    Script(Arc<Route>),
+    Native(crate::native::NativeHandler),
 }
 
 /// What a path's handlers make of one request.
@@ -562,9 +639,9 @@ fn build_method_router(entries: Vec<RouteEntry>) -> MethodRouter {
     //
     // The routes are behind `Arc`s: cloning one per request is a plain
     // refcount bump, with no Python object touched on the tokio worker.
-    let (scopes, routes): (Vec<RouteScope>, Vec<Arc<Route>>) = entries
+    let (scopes, routes): (Vec<RouteScope>, Vec<Serve>) = entries
         .into_iter()
-        .map(|entry| (entry.scope, entry.route))
+        .map(|entry| (entry.scope, entry.serve))
         .unzip();
     let scopes = Arc::new(scopes);
     let routes = Arc::new(routes);
@@ -610,11 +687,11 @@ impl RouteMatch {
 async fn dispatch(
     req: AxumRequest,
     scopes: Arc<Vec<RouteScope>>,
-    routes: Arc<Vec<Arc<Route>>>,
+    routes: Arc<Vec<Serve>>,
 ) -> AxumResponse {
-    let route = match route_gate(&scopes, &req) {
+    let serve = match route_gate(&scopes, &req) {
         RouteMatch::Handler(index) => match routes.get(index) {
-            Some(route) => Arc::clone(route),
+            Some(serve) => serve.clone(),
             None => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
         },
         refused => return refused.refusal(),
@@ -630,7 +707,22 @@ async fn dispatch(
     };
 
     let request = request_from_parts(&parts, body_bytes.to_vec());
-    crate::dispatch::answer(route, request).await
+    match serve {
+        Serve::Script(route) => crate::dispatch::answer(route, request).await,
+        Serve::Native(handler) => {
+            // On this tokio task, without the interpreter.
+            let started = std::time::Instant::now();
+            let mut response = handler(request).await.into_response();
+            response
+                .extensions_mut()
+                .insert(crate::timing::HandlerStamps {
+                    job_started: started,
+                    handoff: None,
+                    finished: std::time::Instant::now(),
+                });
+            response
+        }
+    }
 }
 
 /// The `Request` a handler receives, from the head of an HTTP request and its

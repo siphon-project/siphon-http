@@ -49,6 +49,7 @@ mod dispatch;
 #[cfg(test)]
 mod dispatch_tests;
 pub mod install;
+pub mod native;
 pub mod outbound;
 #[cfg(test)]
 mod outbound_tests;
@@ -65,7 +66,8 @@ mod x509;
 pub use client::Client;
 pub use config::{ClientConfig, HttpConfig, ServerConfig, TlsConfig};
 pub use connection::{Listener, PeerCertificate, TlsInfo};
-pub use install::{namespace, task, task_with_admission};
+pub use install::{namespace, task, task_with_admission, task_with_native};
+pub use native::{NativeFuture, NativeHandler, NativeResponse, NativeRouteError, NativeRoutes};
 pub use outbound::{ClientError, HttpClient, Reply};
 pub use request::Request;
 pub use response::Response;

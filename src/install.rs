@@ -89,3 +89,16 @@ pub fn task_with_admission(
         crate::runtime::spawn_with(cfg, script, Some(admission));
     }
 }
+
+/// [`task_with_admission`], also serving `native` routes: Rust handlers that
+/// answer without the interpreter (see [`crate::native`]). `admission` is
+/// optional here.
+pub fn task_with_native(
+    cfg: HttpConfig,
+    native: crate::native::NativeRoutes,
+    admission: Option<std::sync::Arc<dyn crate::admission::Admission>>,
+) -> impl FnOnce(siphon::script::ScriptHandle) + Send + 'static {
+    move |script| {
+        crate::runtime::spawn_with_native(cfg, script, admission, native);
+    }
+}

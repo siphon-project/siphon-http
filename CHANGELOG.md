@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.1.0] — 2026-11-15
+
+### Added
+
+- Native routes: a composing binary serves routes with Rust handlers
+  (`NativeRoutes`, `task_with_native`), with no executor job, no interpreter
+  attach and no asyncio. They share the router with `@http.route`: path
+  matching, listeners, 404/405, `limits`, body cap, request timeout,
+  Retry-After and the timing metrics. A native route takes the place of a
+  scripted one on the same path, method and listener, with a startup
+  warning. `Request` gains Rust accessors and a builder for testing native
+  handlers.
+
 ## [3.0.0] — 2026-11-14
 
 ### Added

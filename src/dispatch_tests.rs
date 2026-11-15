@@ -813,6 +813,7 @@ fn every_attach_goes_through_the_counted_helper() {
 /// options, which is where the runtime reads it from.
 #[test]
 fn the_decorators_register_the_function_they_wrap() {
+    let _serial = serial();
     Python::attach(|py| {
         let namespace = crate::namespace(HttpConfig::default())(py).expect("the namespace builds");
         let globals = pyo3::types::PyDict::new(py);
@@ -822,15 +823,21 @@ fn the_decorators_register_the_function_they_wrap() {
 registry = types.ModuleType('_siphon_registry')
 registry.calls = []
 registry.register = lambda *args: registry.calls.append(args)
+previous = sys.modules.get('_siphon_registry')
 sys.modules['_siphon_registry'] = registry
+try:
+    @http.route('/a')
+    def route_handler(req):
+        return None
 
-@http.route('/a')
-def route_handler(req):
-    return None
-
-@http.middleware
-async def guard(req):
-    return None
+    @http.middleware
+    async def guard(req):
+        return None
+finally:
+    if previous is None:
+        del sys.modules['_siphon_registry']
+    else:
+        sys.modules['_siphon_registry'] = previous
 
 registered = [(call[0], call[4]['handler'] is call[2], call[3]) for call in registry.calls]
 ",
@@ -1186,4 +1193,204 @@ fn headers_invalid_dict_entries_return_500() {
     for path in ["/invalid_header_value", "/invalid_header_key"] {
         assert_eq!(get(&router, path), (500, "bad response\n".into()));
     }
+}
+
+// ── Routes without middlewares, through the script handle ────────────────
+
+/// What a route handler awaits in the tests below: siphon awaitables, which
+/// the driver's runner can step without an asyncio task.
+#[pyfunction]
+fn siphon_step(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    siphon::script::blocking::awaitable(py, async move {
+        tokio::task::yield_now().await;
+        Ok(())
+    })
+}
+
+/// A siphon awaitable that does not finish within any test's patience.
+#[pyfunction]
+fn siphon_never(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    siphon::script::blocking::awaitable(py, async move {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        Ok(())
+    })
+}
+
+const ENGINE_SCRIPT: &str = r#"
+import asyncio
+import _siphon_registry as _r
+import siphon_http_direct_test as probe
+
+
+def in_task():
+    # The runner puts its own stand-in in place as the current task; only a
+    # real asyncio.Task is a task here. The type alone is read: asking the
+    # stand-in anything would hand the handler over to a real task.
+    try:
+        return type(asyncio.current_task()) is asyncio.Task
+    except RuntimeError:
+        return False
+
+
+async def stepped(req):
+    await probe.siphon_step()
+    await probe.siphon_step()
+    return probe.Response(status=200, body=f"task={in_task()}")
+
+
+async def uses_asyncio(req):
+    # A real asyncio future (sleep(0) is a bare yield the runner steps).
+    await asyncio.sleep(0.001)
+    return probe.Response(status=200, body=f"task={in_task()}")
+
+
+def plain(req):
+    return probe.Response(status=201, body=b"plain")
+
+
+async def raises_after_await(req):
+    await probe.siphon_step()
+    raise ValueError("nope")
+
+
+async def hangs(req):
+    await probe.siphon_never()
+    return probe.Response(status=200, body=b"never")
+
+
+for name, handler in (("stepped", stepped), ("uses_asyncio", uses_asyncio), ("plain", plain),
+                      ("raises_after_await", raises_after_await), ("hangs", hangs)):
+    _r.register("http.route", None, handler, asyncio.iscoroutinefunction(handler),
+                {"path": "/" + name, "methods": ["GET"], "listeners": None, "handler": handler})
+"#;
+
+/// A script engine with [`ENGINE_SCRIPT`] loaded and a handle on it, built
+/// once: the handlers are registered the way the façade registers them.
+fn engine_handle() -> siphon::script::ScriptHandle {
+    static ENGINE: OnceLock<siphon::script::engine::ScriptEngine> = OnceLock::new();
+    runtime();
+    let engine = ENGINE.get_or_init(|| {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "siphon_http_direct_test").unwrap();
+            module
+                .add("Response", py.get_type::<crate::Response>())
+                .unwrap();
+            module
+                .add_function(wrap_pyfunction!(siphon_step, &module).unwrap())
+                .unwrap();
+            module
+                .add_function(wrap_pyfunction!(siphon_never, &module).unwrap())
+                .unwrap();
+            py.import("sys")
+                .and_then(|sys| sys.getattr("modules"))
+                .and_then(|modules| modules.set_item("siphon_http_direct_test", &module))
+                .unwrap();
+        });
+        siphon::script::engine::ScriptEngine::new_embedded(ENGINE_SCRIPT)
+            .expect("the test script loads")
+    });
+    siphon::script::ScriptHandle::for_engine(engine, runtime().handle().clone())
+}
+
+/// The router `spawn_with` builds from the engine's `http.route` handlers,
+/// behind `middlewares` (functions of the dispatch test script).
+fn engine_router(middlewares: &[&str]) -> Router {
+    let script = engine_handle();
+    let (routes, middlewares) = Python::attach(|py| {
+        let routes = crate::runtime::read_routes(py, &script.handlers_for("http.route"));
+        let middlewares: Vec<Stage> = middlewares.iter().map(|name| stage(py, name)).collect();
+        (routes, Arc::new(middlewares))
+    });
+    crate::runtime::build_router_for(routes, middlewares, &HttpConfig::default(), Some(&script))
+        .expect("the router builds")
+        .0
+}
+
+/// Turn `script.direct_dispatch` on for the life of the guard.
+struct DirectDispatch;
+
+impl DirectDispatch {
+    fn on() -> Self {
+        let pool = AsyncPool::global().expect("the test runtime installs the pool");
+        assert!(
+            siphon::script::runner::configure(true, &pool),
+            "the switch took"
+        );
+        DirectDispatch
+    }
+}
+
+impl Drop for DirectDispatch {
+    fn drop(&mut self) {
+        if let Some(pool) = AsyncPool::global() {
+            siphon::script::runner::configure(false, &pool);
+        }
+    }
+}
+
+#[test]
+fn a_route_without_middlewares_is_stepped_without_a_task_when_direct_dispatch_is_on() {
+    let _serial = serial();
+    let router = engine_router(&[]);
+    let _on = DirectDispatch::on();
+    assert_eq!(get(&router, "/stepped"), (200, "task=False".to_string()));
+}
+
+#[test]
+fn a_route_without_middlewares_runs_as_before_when_direct_dispatch_is_off() {
+    let _serial = serial();
+    let router = engine_router(&[]);
+    assert_eq!(get(&router, "/stepped"), (200, "task=True".to_string()));
+    assert_eq!(get(&router, "/plain"), (201, "plain".to_string()));
+}
+
+#[test]
+fn a_route_that_uses_asyncio_answers_and_then_starts_as_a_task_when_direct_dispatch_is_on() {
+    let _serial = serial();
+    let router = engine_router(&[]);
+    let _on = DirectDispatch::on();
+    // The first call is handed over to a task when it awaits an asyncio
+    // future and still answers; siphon remembers the handler, so the next
+    // call starts as a task.
+    assert_eq!(get(&router, "/uses_asyncio").0, 200);
+    assert_eq!(
+        get(&router, "/uses_asyncio"),
+        (200, "task=True".to_string())
+    );
+}
+
+#[test]
+fn a_route_through_the_script_handle_answers_its_errors_as_before() {
+    let _serial = serial();
+    let router = engine_router(&[]);
+    let off = get(&router, "/raises_after_await");
+    let _on = DirectDispatch::on();
+    assert_eq!(get(&router, "/raises_after_await"), off);
+    assert_eq!(off.0, 500, "{off:?}");
+    assert_eq!(get(&router, "/plain"), (201, "plain".to_string()));
+}
+
+#[test]
+fn a_route_with_middlewares_keeps_the_asyncio_path() {
+    let _serial = serial();
+    let router = engine_router(&["passes"]);
+    let _on = DirectDispatch::on();
+    assert_eq!(get(&router, "/stepped"), (200, "task=True".to_string()));
+}
+
+/// The coroutine timeout still bounds a handler that never finishes, and
+/// the request is answered (the test pool's timeout is 10 s).
+#[test]
+fn a_route_through_the_script_handle_that_hangs_is_answered_at_the_timeout() {
+    let _serial = serial();
+    let router = engine_router(&[]);
+    let _on = DirectDispatch::on();
+    let started = Instant::now();
+    let (status, _) = get(&router, "/hangs");
+    assert_eq!(status, 500);
+    assert!(
+        started.elapsed() >= Duration::from_secs(9),
+        "answered by the timeout, not early: {:?}",
+        started.elapsed()
+    );
 }

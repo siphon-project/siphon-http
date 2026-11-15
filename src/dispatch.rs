@@ -21,6 +21,14 @@
 //! [`ResponseSink`]. Neither the executor worker nor the axum task waits on
 //! the coroutine while attached; the axum task awaits a channel holding the
 //! finished response.
+//!
+//! A route without middlewares is called through siphon's script handle
+//! (`ScriptHandle::call_handler_with`) instead: siphon runs the handler in an
+//! executor job and, when it suspends, decides how to finish it. With
+//! `script.direct_dispatch` on, an `async def` that awaits only siphon's
+//! awaitables is stepped on its asyncio driver without a task; with it off,
+//! or once a handler uses asyncio, it runs as a task on the asyncio pool, as
+//! above. The handler is bounded by the same coroutine timeout either way.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -33,7 +41,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::PyTuple;
 use siphon::script::async_pool::AsyncPool;
 use siphon::script::inline_dispatch::run_coroutine_inline;
-use siphon::script::HandlerHandle;
+use siphon::script::{HandlerHandle, ScriptHandle};
 use tokio::sync::oneshot;
 
 use crate::timing::{HandlerStamps, Handoff};
@@ -56,11 +64,18 @@ where
 pub(crate) struct Stage {
     callable: Py<PyAny>,
     is_async: bool,
+    /// The registration the function came from, when it came from one: a
+    /// route handler is then called through the script handle.
+    handle: Option<HandlerHandle>,
 }
 
 impl Stage {
     pub(crate) fn new(callable: Py<PyAny>, is_async: bool) -> Self {
-        Self { callable, is_async }
+        Self {
+            callable,
+            is_async,
+            handle: None,
+        }
     }
 
     /// The function the façade registered, read from the options it
@@ -75,7 +90,10 @@ impl Stage {
                 handle.kind()
             ))
         })?;
-        Ok(Self::new(callable.unbind(), handle.is_async()))
+        Ok(Self {
+            handle: Some(handle.clone()),
+            ..Self::new(callable.unbind(), handle.is_async())
+        })
     }
 }
 
@@ -86,6 +104,12 @@ pub(crate) struct Route {
     /// Every stage as `(function, is_async, is_middleware)`, built once, for
     /// the coroutine that runs the stages from the first `async def` on.
     stages: Py<PyTuple>,
+    /// A route without middlewares whose handler came from the script's
+    /// registry: siphon calls it, and steps an `async def` that awaits only
+    /// siphon's awaitables on its asyncio driver without a task when
+    /// `script.direct_dispatch` is on (the same asyncio pool path as
+    /// [`hand_off`] when it is off).
+    direct: Option<(ScriptHandle, HandlerHandle)>,
 }
 
 impl Route {
@@ -93,6 +117,7 @@ impl Route {
         py: Python<'_>,
         middlewares: Arc<Vec<Stage>>,
         handler: Stage,
+        script: Option<&ScriptHandle>,
     ) -> PyResult<Self> {
         let mut entries = Vec::with_capacity(middlewares.len() + 1);
         for stage in middlewares.iter() {
@@ -102,10 +127,17 @@ impl Route {
         entries
             .push((handler.callable.bind(py).clone(), handler.is_async, false).into_pyobject(py)?);
         let stages = PyTuple::new(py, entries)?.unbind();
+        let direct = match (script, &handler.handle) {
+            (Some(script), Some(handle)) if middlewares.is_empty() => {
+                Some((script.clone(), handle.clone()))
+            }
+            _ => None,
+        };
         Ok(Self {
             middlewares,
             handler,
             stages,
+            direct,
         })
     }
 }
@@ -189,6 +221,9 @@ impl Reply {
 /// Answer `request` through `route`. Called on a tokio worker; does not
 /// attach.
 pub(crate) async fn answer(route: Arc<Route>, request: PyRequest) -> AxumResponse {
+    if let Some((script, handle)) = &route.direct {
+        return answer_through(script, handle, request).await;
+    }
     let job = siphon::script::py_executor::try_run(move || attach(|py| start(py, &route, request)));
     match job.await {
         Ok(Started::Answered(reply, stamps)) => stamped(reply, stamps),
@@ -206,6 +241,51 @@ pub(crate) async fn answer(route: Arc<Route>, request: PyRequest) -> AxumRespons
             tracing::error!(
                 target: "siphon_http",
                 "http request could not run on the Python executor (queue full or job panicked)"
+            );
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+/// Answer `request` by calling the route's handler through the script
+/// handle. Called on a tokio worker; does not attach: building the `Request`
+/// object and reading the handler's result happen in executor jobs.
+async fn answer_through(
+    script: &ScriptHandle,
+    handle: &HandlerHandle,
+    request: PyRequest,
+) -> AxumResponse {
+    // Set once, in the job that calls the handler; read after the answer.
+    let job_started = Arc::new(std::sync::OnceLock::new());
+    let started = Arc::clone(&job_started);
+    let reply = script
+        .call_handler_with(
+            handle,
+            move |py| {
+                let _ = started.set(Instant::now());
+                Ok(vec![Py::new(py, request)?.into_any()])
+            },
+            |_py, returned| match returned {
+                Ok(value) => stage_response(&value, false),
+                Err(error) => stage_raised(&error, false),
+            },
+        )
+        .await;
+    match reply {
+        Ok(reply) => {
+            let finished = Instant::now();
+            let stamps = HandlerStamps {
+                job_started: job_started.get().copied().unwrap_or(finished),
+                handoff: None,
+                finished,
+            };
+            stamped(reply, stamps)
+        }
+        Err(error) => {
+            tracing::error!(
+                target: "siphon_http",
+                %error,
+                "http request could not run its handler (executor or asyncio drivers full, or the job was lost)"
             );
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         }

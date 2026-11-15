@@ -202,7 +202,7 @@ pub fn spawn_with(cfg: HttpConfig, script: ScriptHandle, admission: Option<Arc<d
     };
 
     let route_count = routes.len();
-    let (mut router, scopes) = match build_router(routes, middlewares, &cfg) {
+    let (mut router, scopes) = match build_router_for(routes, middlewares, &cfg, Some(&script)) {
         Ok(built) => built,
         Err(error) => {
             tracing::error!(target: "siphon_http", %error, "http routes could not be built");
@@ -316,7 +316,7 @@ fn guarded(router: Router, admission: Arc<dyn Admission>) -> Router {
 
 /// Each `@http.route` handler's options and function, read in one attach at
 /// startup. A route whose options are malformed is skipped with a warning.
-fn read_routes(py: Python<'_>, handles: &[HandlerHandle]) -> Vec<(RouteOptions, Stage)> {
+pub(crate) fn read_routes(py: Python<'_>, handles: &[HandlerHandle]) -> Vec<(RouteOptions, Stage)> {
     let mut routes = Vec::with_capacity(handles.len());
     for handle in handles {
         let read = read_route_options(py, handle)
@@ -336,6 +336,17 @@ pub(crate) fn build_router(
     middlewares: Arc<Vec<Stage>>,
     cfg: &HttpConfig,
 ) -> PyResult<(Router, Vec<(String, RouteScope)>)> {
+    build_router_for(routes, middlewares, cfg, None)
+}
+
+/// [`build_router`], with the script handle the route handlers are called
+/// through when a route has no middlewares.
+pub(crate) fn build_router_for(
+    routes: Vec<(RouteOptions, Stage)>,
+    middlewares: Arc<Vec<Stage>>,
+    cfg: &HttpConfig,
+    script: Option<&ScriptHandle>,
+) -> PyResult<(Router, Vec<(String, RouteScope)>)> {
     let mut by_path: HashMap<String, Vec<RouteEntry>> = HashMap::new();
 
     // One attach, at startup, to lay out each route's stages.
@@ -344,7 +355,7 @@ pub(crate) fn build_router(
             if options.path.is_empty() {
                 continue;
             }
-            let route = Route::new(py, Arc::clone(&middlewares), handler)?;
+            let route = Route::new(py, Arc::clone(&middlewares), handler, script)?;
             by_path.entry(options.path).or_default().push(RouteEntry {
                 scope: RouteScope {
                     methods: options.methods,

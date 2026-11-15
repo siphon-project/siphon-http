@@ -1447,3 +1447,20 @@ def sync_ok(req):
         );
     }
 }
+
+#[test]
+fn a_request_built_for_a_native_handler_reads_back() {
+    let request = crate::Request::new("put", "/a/b")
+        .with_path_param("name", "b")
+        .with_query_param("limit", "3")
+        .with_header("Content-Type", "text/plain")
+        .with_body(b"x".to_vec())
+        .with_host("example.com:8080");
+    assert_eq!(request.method, "PUT");
+    assert_eq!(request.path_param("name"), Some("b"));
+    assert_eq!(request.query().get("limit").map(String::as_str), Some("3"));
+    assert_eq!(request.header_value("content-type"), Some("text/plain"));
+    assert_eq!(request.body_bytes(), b"x");
+    assert_eq!(request.host.as_deref(), Some("example.com:8080"));
+    assert!(!request.is_tls());
+}

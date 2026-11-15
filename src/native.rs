@@ -179,6 +179,56 @@ impl Request {
         &self.query_params
     }
 
+    /// A request as a native handler would receive it, for testing a
+    /// handler without a server: no path or query parameters, header
+    /// fields or body, from 127.0.0.1, on no listener.
+    pub fn new(method: &str, path: &str) -> Self {
+        Self::from_parts(
+            method.to_ascii_uppercase(),
+            path.to_string(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            Vec::new(),
+            "127.0.0.1:0".to_string(),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+        )
+    }
+
+    /// With the path parameter `name`, as the matched route extracts it.
+    pub fn with_path_param(mut self, name: &str, value: &str) -> Self {
+        self.path_params.insert(name.to_string(), value.to_string());
+        self
+    }
+
+    /// With the query parameter `name`.
+    pub fn with_query_param(mut self, name: &str, value: &str) -> Self {
+        self.query_params
+            .insert(name.to_string(), value.to_string());
+        self
+    }
+
+    /// With the header field `name` (stored lower-cased, as received).
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers
+            .insert(name.to_ascii_lowercase(), value.to_string());
+        self
+    }
+
+    /// With `body` as the buffered body.
+    pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body_bytes = body.into();
+        self
+    }
+
+    /// Addressed to `host` (the authority of the request target).
+    pub fn with_host(mut self, host: &str) -> Self {
+        self.host = Some(host.to_string());
+        self
+    }
+
     /// Whether the request arrived over TLS on one of the addon's
     /// listeners (what `request.tls is not None` tells a script).
     pub fn is_tls(&self) -> bool {

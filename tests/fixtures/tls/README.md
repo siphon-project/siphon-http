@@ -13,3 +13,5 @@ private keys are in this directory on purpose.
 All are P-256 and valid until 2126. The tests compare what a handler reads
 with what `openssl x509 -noout -subject -nameopt RFC2253 -ext subjectAltName
 -fingerprint -sha256 -in client.pem` prints.
+- `pinned.pem`, `pinned.key`: a self-signed certificate for
+  `host.example.com` only, for the address-pinning tests.

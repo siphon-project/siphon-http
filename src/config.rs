@@ -253,12 +253,38 @@ pub struct ClientConfig {
     #[serde(default = "default_follow_redirects")]
     pub follow_redirects: bool,
 
+    /// Redirect handling in one setting: `false` or `0` hands every 3xx back
+    /// as received, a number follows at most that many hops (an error past
+    /// it), `true` follows up to 10. When set it takes precedence over
+    /// `follow_redirects`; when absent `follow_redirects` decides.
+    #[serde(default)]
+    pub redirects: Option<Redirects>,
+
+    /// Pin host names to socket addresses: a request to a listed host
+    /// connects to exactly these addresses (tried in order) and never asks
+    /// DNS. TLS still names the host in the SNI and verifies the certificate
+    /// against it, and the URL keeps the host. The port of the URL is used,
+    /// not the one written in the address. Lets a caller vet an address and
+    /// then connect to that very address.
+    #[serde(default)]
+    pub resolve: std::collections::BTreeMap<String, Vec<String>>,
+
     /// Look at `verify`, `cert` and `key` at most every this many seconds,
     /// on the next request, and when one changed, build the pool again
     /// from the files as they are now. Files that do not load are logged
     /// and the previous pool kept. Without it they are read once.
     #[serde(default)]
     pub reload_seconds: Option<u64>,
+}
+
+/// The `redirects` setting: a switch or a hop limit.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Redirects {
+    /// `true` follows up to 10 hops, `false` none.
+    Follow(bool),
+    /// At most this many hops; `0` follows none.
+    Limit(u32),
 }
 
 fn default_max_body() -> usize {

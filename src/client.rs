@@ -10,16 +10,17 @@
 //!
 //! All methods are coroutines returning a [`crate::Response`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
 use std::time::Duration;
 
-use pyo3::exceptions::{PyRuntimeError, PyTypeError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyString};
+use pyo3::types::{PyBool, PyBytes, PyString};
 use reqwest::Method;
 use siphon::script::blocking::awaitable;
 
-use crate::config::ClientConfig;
+use crate::config::{ClientConfig, Redirects};
 use crate::outbound::{ClientError, HttpClient};
 use crate::Response as PyResponse;
 
@@ -52,13 +53,50 @@ pub(crate) fn trusting(
     Ok(builder)
 }
 
-/// Hand a 3xx back as received instead of following it, unless `follow`.
-fn redirecting(builder: reqwest::ClientBuilder, follow: bool) -> reqwest::ClientBuilder {
-    if follow {
-        builder
-    } else {
-        builder.redirect(reqwest::redirect::Policy::none())
+/// Hand a 3xx back as received instead of following it, unless `follow`;
+/// `redirects`, when set, decides instead (a hop limit, or a switch).
+fn redirecting(
+    builder: reqwest::ClientBuilder,
+    follow: bool,
+    redirects: Option<Redirects>,
+) -> reqwest::ClientBuilder {
+    match redirects {
+        Some(Redirects::Follow(true)) => builder,
+        Some(Redirects::Follow(false)) | Some(Redirects::Limit(0)) => {
+            builder.redirect(reqwest::redirect::Policy::none())
+        }
+        Some(Redirects::Limit(hops)) => {
+            builder.redirect(reqwest::redirect::Policy::limited(hops as usize))
+        }
+        None if follow => builder,
+        None => builder.redirect(reqwest::redirect::Policy::none()),
     }
+}
+
+/// Connect a listed host to exactly its addresses, without DNS. The host
+/// stays the name for SNI, certificate verification and `Host`.
+pub(crate) fn pinning(
+    mut builder: reqwest::ClientBuilder,
+    resolve: &BTreeMap<String, Vec<String>>,
+) -> Result<reqwest::ClientBuilder, String> {
+    for (host, addresses) in resolve {
+        if host.trim().is_empty() {
+            return Err("resolve: empty host name".into());
+        }
+        if addresses.is_empty() {
+            return Err(format!("resolve {host}: no address"));
+        }
+        let parsed = addresses
+            .iter()
+            .map(|address| {
+                address.parse::<SocketAddr>().map_err(|_| {
+                    format!("resolve {host}: {address:?} is not an IP:port socket address")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        builder = builder.resolve_to_addrs(host, &parsed);
+    }
+    Ok(builder)
 }
 
 #[pyclass(module = "siphon", name = "Client")]
@@ -78,6 +116,8 @@ impl Client {
         http2_prior_knowledge=false,
         verify_only=false,
         follow_redirects=true,
+        resolve=None,
+        redirects=None,
     ))]
     fn new(
         name: Option<&str>,
@@ -88,6 +128,8 @@ impl Client {
         http2_prior_knowledge: bool,
         verify_only: bool,
         follow_redirects: bool,
+        resolve: Option<Bound<'_, PyAny>>,
+        redirects: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         // Named-client lookup resolves against the install-time HttpConfig
         // stashed by the runtime (see `crate::runtime::set_named_clients`).
@@ -95,8 +137,16 @@ impl Client {
             return Self::from_named(name);
         }
 
+        let resolve = resolve
+            .map(extract_resolve)
+            .transpose()?
+            .unwrap_or_default();
+        let redirects = redirects.map(extract_redirects).transpose()?;
+
         let mut builder =
             reqwest::Client::builder().timeout(Duration::from_millis(timeout_ms.unwrap_or(5_000)));
+
+        builder = pinning(builder, &resolve).map_err(PyValueError::new_err)?;
 
         builder = trusting(builder, verify, verify_only).map_err(PyRuntimeError::new_err)?;
 
@@ -110,7 +160,7 @@ impl Client {
             builder = builder.http2_prior_knowledge();
         }
 
-        let inner = redirecting(builder, follow_redirects)
+        let inner = redirecting(builder, follow_redirects, redirects)
             .build()
             .map_err(|e| PyRuntimeError::new_err(format!("build reqwest client: {e}")))?;
 
@@ -236,7 +286,10 @@ impl Client {
             builder = builder.http2_prior_knowledge();
         }
 
-        redirecting(builder, cfg.follow_redirects)
+        builder = pinning(builder, &cfg.resolve)
+            .map_err(|reason| ClientError::Configuration { reason })?;
+
+        redirecting(builder, cfg.follow_redirects, cfg.redirects)
             .build()
             .map_err(|e| ClientError::Configuration {
                 reason: format!("build reqwest client: {e}"),
@@ -270,6 +323,44 @@ impl Client {
                 reply.body,
             ))
         })
+    }
+}
+
+/// `resolve=`: a dict of host to one socket address string or a list of them.
+fn extract_resolve(obj: Bound<'_, PyAny>) -> PyResult<BTreeMap<String, Vec<String>>> {
+    let map: HashMap<String, Bound<'_, PyAny>> = obj.extract().map_err(|_| {
+        PyTypeError::new_err("resolve= must be a dict of host to \"IP:port\" or a list of them")
+    })?;
+    let mut resolve = BTreeMap::new();
+    for (host, value) in map {
+        let addresses = if let Ok(single) = value.extract::<String>() {
+            vec![single]
+        } else if let Ok(many) = value.extract::<Vec<String>>() {
+            many
+        } else {
+            return Err(PyValueError::new_err(format!(
+                "resolve {host}: expected \"IP:port\" or a list of them"
+            )));
+        };
+        resolve.insert(host, addresses);
+    }
+    Ok(resolve)
+}
+
+/// `redirects=`: `False` (or 0) for none, a hop limit, or `True` for the
+/// default.
+fn extract_redirects(obj: Bound<'_, PyAny>) -> PyResult<Redirects> {
+    // A bool is an int in Python: ask for it first.
+    if let Ok(flag) = obj.cast::<PyBool>() {
+        return Ok(Redirects::Follow(flag.is_true()));
+    }
+    match obj.extract::<i64>() {
+        Ok(hops) => u32::try_from(hops)
+            .map(Redirects::Limit)
+            .map_err(|_| PyValueError::new_err("redirects= must be False, True or 0 or more")),
+        Err(_) => Err(PyTypeError::new_err(
+            "redirects= must be a bool or a number of hops",
+        )),
     }
 }
 

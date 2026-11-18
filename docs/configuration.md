@@ -177,6 +177,9 @@ clients:
     pool_size: 16
     http2_prior_knowledge: false
     follow_redirects: true
+    redirects: 3
+    resolve:
+      hooks.example.com: ["192.0.2.10:443"]
 ```
 
 | Key | Type | Description |
@@ -189,6 +192,8 @@ clients:
 | `pool_size` | int | Optional. Max pooled connections. |
 | `http2_prior_knowledge` | bool | Optional. Start cleartext connections directly in HTTP/2 (h2c) instead of HTTP/1.1. TLS uses ALPN regardless. |
 | `follow_redirects` | bool | Optional, default `true`: a 3xx is followed to its `Location` (up to 10 hops) inside the request. `false` returns the 3xx to the script as received, `Location` and the other headers included, to relay or follow itself. |
+| `redirects` | bool / int | Optional. `false` or `0` returns every 3xx as received; a number follows at most that many hops (more is an error); `true` follows up to 10. Takes precedence over `follow_redirects` when set. |
+| `resolve` | map | Optional. Host name to a list of `IP:port` socket addresses. A request to such a host connects to exactly those addresses (in order) and never asks DNS; the SNI, the certificate check and the `Host` header keep the host name. The port of the URL is used, not the one in the address. A bad address fails when the client is built. |
 | `reload_seconds` | int | Optional. On a request at most this often, check `verify`, `cert` and `key`; when one changed the pool is built again from them. Files that do not load are logged and the previous pool stays. Without it they are read once. |
 
 Rust code that links siphon-http reaches the same pool with

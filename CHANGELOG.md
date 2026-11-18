@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `http.Client(resolve=..., redirects=...)` and `clients.<name>.resolve` /
+  `redirects`: pin a host name to socket addresses (the connection goes to
+  exactly those, with SNI, certificate verification and `Host` still using the
+  name), so a caller can check an address and connect to that same address.
+  `redirects` is `False`/`0` for none, a hop limit, or `True`; it takes
+  precedence over `follow_redirects`.
+
 ## [3.1.0] — 2026-11-15
 
 ### Added

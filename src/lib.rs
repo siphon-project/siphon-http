@@ -41,6 +41,8 @@
 
 pub mod admission;
 pub mod client;
+#[cfg(test)]
+mod client_tests;
 pub mod config;
 pub mod connection;
 #[cfg(test)]
@@ -64,7 +66,7 @@ mod timing;
 mod x509;
 
 pub use client::Client;
-pub use config::{ClientConfig, HttpConfig, ServerConfig, TlsConfig};
+pub use config::{ClientConfig, HttpConfig, Redirects, ServerConfig, TlsConfig};
 pub use connection::{Listener, PeerCertificate, TlsInfo};
 pub use install::{namespace, task, task_with_admission, task_with_native};
 pub use native::{NativeFuture, NativeHandler, NativeResponse, NativeRouteError, NativeRoutes};

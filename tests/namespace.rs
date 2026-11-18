@@ -82,3 +82,62 @@ fn the_namespace_is_the_module_siphon_http() {
         }
     });
 }
+
+fn client_error(py: Python<'_>, arguments: &str) -> Option<String> {
+    let namespace = build_namespace(py);
+    let locals = PyDict::new(py);
+    locals.set_item("http", &namespace).unwrap();
+    let code = std::ffi::CString::new(format!(
+        "try:\n    http.Client({arguments})\n    out = None\nexcept Exception as e:\n    out = type(e).__name__ + ': ' + str(e)\n"
+    ))
+    .unwrap();
+    py.run(code.as_c_str(), None, Some(&locals)).unwrap();
+    locals
+        .get_item("out")
+        .unwrap()
+        .unwrap()
+        .extract::<Option<String>>()
+        .unwrap()
+}
+
+#[test]
+fn an_inline_client_takes_resolve_and_redirects() {
+    Python::attach(|py| {
+        for arguments in [
+            r#"resolve={"host.example.com": ["192.0.2.10:443", "[2001:db8::1]:443"]}"#,
+            r#"resolve={"host.example.com": "192.0.2.10:443"}"#,
+            "redirects=False",
+            "redirects=0",
+            "redirects=3",
+            r#"resolve={"host.example.com": ["192.0.2.10:443"]}, redirects=False"#,
+        ] {
+            assert_eq!(client_error(py, arguments), None, "{arguments}");
+        }
+    });
+}
+
+#[test]
+fn an_inline_client_refuses_bad_resolve_and_redirects_at_construction() {
+    Python::attach(|py| {
+        for (arguments, expected) in [
+            (
+                r#"resolve={"host.example.com": ["not-an-address"]}"#,
+                "host.example.com",
+            ),
+            (
+                r#"resolve={"host.example.com": ["192.0.2.10"]}"#,
+                "host.example.com",
+            ),
+            (r#"resolve={"host.example.com": []}"#, "host.example.com"),
+            (r#"resolve={"": ["192.0.2.10:443"]}"#, "host"),
+            (r#"resolve={"host.example.com": [443]}"#, "host.example.com"),
+            (r#"resolve=["192.0.2.10:443"]"#, "resolve"),
+            ("redirects=-1", "redirects"),
+            (r#"redirects="no""#, "redirects"),
+        ] {
+            let error = client_error(py, arguments)
+                .unwrap_or_else(|| panic!("{arguments} should be refused"));
+            assert!(error.contains(expected), "{arguments}: {error}");
+        }
+    });
+}

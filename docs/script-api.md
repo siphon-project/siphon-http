@@ -224,6 +224,8 @@ http.Client("api")                       # named — looks up clients.api in htt
 http.Client(base_url="https://example.com",   # inline
             verify="/path/ca.crt",
             cert=("/path/c.crt", "/path/c.key"))
+http.Client(resolve={"hooks.example.com": ["192.0.2.10:443"]},   # connect here, verify the name
+            redirects=False)
 ```
 
 Named clients share the pool configured under `clients.<name>` in
@@ -241,6 +243,8 @@ Constructor keyword arguments:
 | `cert` | Client-cert identity for mTLS — a combined PEM or a `(cert, key)` pair. |
 | `timeout_ms` | Per-request timeout in milliseconds. |
 | `http2_prior_knowledge` | Start cleartext connections in h2c. |
+| `redirects` | Default `None`. `False` or `0` returns every 3xx as received; an `int` follows at most that many hops; `True` follows up to 10. Takes precedence over `follow_redirects`. |
+| `resolve` | Default `None`. A dict of host name to an `"IP:port"` string or a list of them. Requests to that host connect to exactly those addresses and never use DNS, while the SNI, the certificate check and `Host` keep the host name (the port of the URL is used, not the one in the address). A malformed entry raises `ValueError` at construction. |
 | `follow_redirects` | Default `True`. `False` returns a 3xx as received, `Location` included, instead of following it. |
 
 All request methods are coroutines returning a [`Response`](#httpresponse):

@@ -11,6 +11,21 @@ use pyo3::types::PyDict;
 
 use siphon_http::HttpConfig;
 
+/// Every test here builds the namespace, and CPython files it in
+/// `sys.modules` as `siphon.http`: building it again re-runs `python/http.py`
+/// in that same module object, putting the prototype classes back for a
+/// moment. Tests running in parallel threads would see each other's module
+/// mid-build, so they take turns. The lock is taken before attaching to the
+/// interpreter, never while attached.
+static NAMESPACE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn attach<R>(body: impl for<'py> FnOnce(Python<'py>) -> R) -> R {
+    let _turn = NAMESPACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Python::attach(body)
+}
+
 fn build_namespace(py: Python<'_>) -> Bound<'_, PyAny> {
     siphon_http::namespace(HttpConfig::default())(py)
         .expect("namespace builds")
@@ -28,7 +43,7 @@ fn sys_modules(py: Python<'_>) -> Bound<'_, PyDict> {
 
 #[test]
 fn the_namespace_leaves_the_standard_library_http_package_importable() {
-    Python::attach(|py| {
+    attach(|py| {
         let namespace = build_namespace(py);
 
         // Each of these fails with "No module named 'http.client'; 'http' is
@@ -60,7 +75,7 @@ fn the_namespace_leaves_the_standard_library_http_package_importable() {
 
 #[test]
 fn the_namespace_is_the_module_siphon_http() {
-    Python::attach(|py| {
+    attach(|py| {
         let namespace = build_namespace(py);
         let name: String = namespace.getattr("__name__").unwrap().extract().unwrap();
         assert_eq!(name, "siphon.http");
@@ -102,7 +117,7 @@ fn client_error(py: Python<'_>, arguments: &str) -> Option<String> {
 
 #[test]
 fn an_inline_client_takes_resolve_and_redirects() {
-    Python::attach(|py| {
+    attach(|py| {
         for arguments in [
             r#"resolve={"host.example.com": ["192.0.2.10:443", "[2001:db8::1]:443"]}"#,
             r#"resolve={"host.example.com": "192.0.2.10:443"}"#,
@@ -118,7 +133,7 @@ fn an_inline_client_takes_resolve_and_redirects() {
 
 #[test]
 fn an_inline_client_refuses_bad_resolve_and_redirects_at_construction() {
-    Python::attach(|py| {
+    attach(|py| {
         for (arguments, expected) in [
             (
                 r#"resolve={"host.example.com": ["not-an-address"]}"#,
